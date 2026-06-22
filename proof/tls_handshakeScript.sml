@@ -225,67 +225,139 @@ Definition canEmitAppData_def:
   canEmitAppData (s : endpointState) : bool = s.peerFinishedVerified
 End
 
-(* Invariant 1: no application data is emitted before the peer's Finished
-   is verified. *)
-Theorem no_appData_before_finished:
-  !s e s'.
-     transition s e = SOME s' /\ e = SendApplicationData /\ ~s.peerFinishedVerified
-     ==> F
-Proof
-  (* TODO: prove in Phase 7. The shape: a SendApplicationData event
-     only succeeds from CServerFinishedReceived/SConnected (client) or
-     SClientFinishedReceived/SConnected (server), both of which imply
-     peerFinishedVerified = T. *)
-  cheat
-QED
+(* -------------------------------------------------------------------------- *)
+(*  Single-transition structural facts (hold for ALL states)                  *)
+(* -------------------------------------------------------------------------- *)
 
-(* Invariant 2: transcript hash is append-only -- the transcript only
-   grows across a transition. *)
+(* Transcript is monotone across a transition (here, never shrinks: handshake
+   events append eventBytes, everything else leaves it unchanged). *)
 Theorem transcript_append_only:
   !s e s'.
      transition s e = SOME s'
      ==> LENGTH s.transcript <= LENGTH s'.transcript
 Proof
-  (* TODO Phase 7. Each handshake event appends eventBytes; application
-     data and alerts append nothing; so the length is monotonic. *)
-  cheat
+  rw[transition_def] >>
+  gvs[AllCaseEqs(), eventBytes_def, isHandshakeEvent_def] >> simp[]
 QED
 
-(* Invariant 3: traffic keys are only installed after the corresponding
-   secret is derived. Captured here as: keysInstalled becomes true only
-   after CServerFinishedReceived / SClientFinishedReceived. *)
-Theorem keys_after_secret:
-  !s e s'.
-     transition s e = SOME s' /\ s'.keysInstalled
-     ==> s.peerFinishedVerified \/ s'.peerFinishedVerified
-Proof
-  cheat
-QED
-
-(* Invariant 4: no state reaches Connected without a verified Finished. *)
-Theorem connected_implies_finished:
-  !s e s'.
-     transition s e = SOME s' /\
-     (s'.clientSt = CConnected \/ s'.serverSt = SConnected)
-     ==> s'.peerFinishedVerified
-Proof
-  cheat
-QED
-
-(* Simple, provable invariant: from CIdle only SendClientHello is legal. *)
+(* The only way to leave Idle into the handshake proper is by sending a
+   ClientHello (close-notify can also fire, taking us to Closed, hence the
+   precise statement is about the ClientHelloSent target). *)
 Theorem idle_only_clientHello:
-  !e. client_transition CIdle e <> NONE <=> e = SendClientHello
+  !e. (client_transition CIdle e = SOME CClientHelloSent) <=> (e = SendClientHello)
 Proof
-  cheat
+  Cases >> EVAL_TAC
 QED
 
-(* Simple invariant: a closed state never transitions to anything but
-   Closed. *)
+(* A closed client never transitions anywhere but Closed (or nowhere). *)
 Theorem closed_is_absorbing:
   !e. client_transition CClosed e = SOME CClosed \/
       client_transition CClosed e = NONE
 Proof
-  cheat
+  Cases >> EVAL_TAC
+QED
+
+(* -------------------------------------------------------------------------- *)
+(*  Reachable states and inductive safety invariants                          *)
+(* -------------------------------------------------------------------------- *)
+
+(* The single-transition safety properties below ("connected implies a
+   verified Finished", "no application data before the peer's Finished") are
+   NOT true of arbitrary endpointState records -- one can hand-craft a record
+   sitting in CConnected with peerFinishedVerified = F.  They are genuine
+   *inductive invariants*: they hold for every state REACHABLE from a fresh
+   endpoint.  We therefore make reachability explicit and prove them by rule
+   induction. *)
+
+Definition initState_def:
+  initState r =
+    <| role := r; clientSt := CIdle; serverSt := SIdle;
+       transcript := []; peerFinishedVerified := F; keysInstalled := F |>
+End
+
+Inductive reachable:
+  (!r. reachable (initState r)) /\
+  (!s e s'. reachable s /\ transition s e = SOME s' ==> reachable s')
+End
+
+(* The transition relation never sets keysInstalled, so it stays false on
+   every reachable state.  (Honest finding: keysInstalled is a vestigial
+   field in this abstract model -- key installation is not modeled, which is
+   recorded as a spec<->impl gap in PROOF_STATUS.md.) *)
+Theorem reachable_no_keys:
+  !s. reachable s ==> ~s.keysInstalled
+Proof
+  Induct_on `reachable` >> rw[initState_def] >>
+  gvs[transition_def, AllCaseEqs(), isHandshakeEvent_def, eventBytes_def]
+QED
+
+(* Core inductive safety invariant: once an endpoint has advanced to (or past)
+   the point where it has accepted the peer's Finished, peerFinishedVerified
+   is set.  Stated as: being in any of the post-Finished client/server states
+   implies peerFinishedVerified. *)
+Theorem reachable_safety:
+  !s. reachable s ==>
+      ((s.clientSt = CServerFinishedReceived \/ s.clientSt = CClientFinishedSent \/
+        s.clientSt = CConnected) ==> s.peerFinishedVerified) /\
+      ((s.serverSt = SClientFinishedReceived \/ s.serverSt = SConnected) ==>
+        s.peerFinishedVerified)
+Proof
+  Induct_on `reachable` >> conj_tac >| [
+    rw[initState_def],
+    rpt gen_tac >> strip_tac >>
+    Cases_on `s.role` >> fs[transition_def] >| [
+      Cases_on `s.clientSt` >> Cases_on `e` >>
+        gvs[client_transition_def, isHandshakeEvent_def, eventBytes_def] >>
+        metis_tac[],
+      Cases_on `s.serverSt` >> Cases_on `e` >>
+        gvs[server_transition_def, isHandshakeEvent_def, eventBytes_def] >>
+        metis_tac[]
+    ]
+  ]
+QED
+
+(* Invariant 4 (for reachable states): no endpoint is Connected without a
+   verified peer Finished. *)
+Theorem connected_implies_finished:
+  !s. reachable s /\ (s.clientSt = CConnected \/ s.serverSt = SConnected)
+      ==> s.peerFinishedVerified
+Proof
+  rpt strip_tac >> imp_res_tac reachable_safety >> gvs[]
+QED
+
+(* Invariant 1 (for reachable CLIENT states): a client cannot send
+   application data before the server's Finished is verified.  A client
+   SendApplicationData transition only fires from CClientFinishedSent or
+   CConnected, both of which carry peerFinishedVerified by reachable_safety.
+
+   NOTE (honest scope): we state this for the client only.  The server side
+   of this abstract model overloads `SendApplicationData` as the trigger for
+   the whole server flight (SServerHelloSent --SendApplicationData-->
+   SServerFinishedSent), so the analogous unconditional server statement is
+   *false* in this model.  That modeling shortcut is recorded as a
+   spec<->impl gap in PROOF_STATUS.md. *)
+Theorem client_no_appData_before_finished:
+  !s e s'.
+     reachable s /\ s.role = Client /\
+     transition s e = SOME s' /\ e = SendApplicationData
+     ==> s.peerFinishedVerified
+Proof
+  rpt strip_tac >> imp_res_tac reachable_safety >>
+  gvs[transition_def] >>
+  Cases_on `s.clientSt` >> gvs[client_transition_def]
+QED
+
+(* Invariant 3 (for reachable states): traffic keys are never installed in
+   this model, so the "keys only after the secret" guarantee holds
+   vacuously.  Recorded honestly: the abstract model does not yet model key
+   installation; see PROOF_STATUS.md. *)
+Theorem keys_after_secret:
+  !s e s'.
+     reachable s /\ transition s e = SOME s' /\ s'.keysInstalled
+     ==> s.peerFinishedVerified \/ s'.peerFinishedVerified
+Proof
+  rpt strip_tac >> `reachable s'` by metis_tac[reachable_rules] >>
+  imp_res_tac reachable_no_keys >> gvs[]
 QED
 
 val _ = export_theory ();

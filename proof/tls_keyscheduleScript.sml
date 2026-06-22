@@ -34,10 +34,6 @@ Definition string_to_word8_def:
   string_to_word8 s = MAP (\c. n2w (ORD c)) (EXPLODE s)
 End
 
-Definition hex_to_word8_def:
-  hex_to_word8 s = []   (* parsed in Phase 7 *)
-End
-
 Definition w16_to_bytes_def:
   w16_to_bytes (w : word16) : word8 list =
        [w2w (w >>> 8); w2w w]
@@ -68,31 +64,52 @@ End
 (*  Trusted crypto primitives                                                 *)
 (* -------------------------------------------------------------------------- *)
 
-(* SHA-256 over a byte list, returning a 32-byte list. Phase 7 links this
-   to a verified SHA-256 from the CakeML tower; until then it is a trusted
-   axiom with a clearly documented contract. *)
-Definition sha256_def:
-  sha256 (bs : word8 list) : word8 list = GENLIST (\_. 0w) hashLen
-End
+(* SHA-256, HMAC-SHA-256 and HKDF-Expand are modeled as TRUSTED, abstract
+   primitives.  We do NOT define their values (so nothing false about their
+   contents can be derived); we only pin down their output-length contracts,
+   which is all the key-schedule correctness arguments below rely on.
 
-(* HMAC-SHA-256. *)
-Definition hmac_sha256_def:
-  hmac_sha256 (key : word8 list) (data : word8 list) : word8 list =
-    GENLIST (\_. 0w) hashLen
-End
+   These are introduced by `new_specification`, a *conservative* (sound)
+   extension -- the existence witness is the constant-length function -- so
+   they carry NO axiom tag.  The cryptographic strength of SHA-256/HMAC
+   (collision/preimage resistance, PRF security) is an assumption recorded
+   in PROOF_STATUS.md, not a proved property.  A future refinement would
+   link `sha256` to a verified bit-level SHA-256 (e.g. from the CakeML
+   tower) and discharge the RFC 8448 test vectors against it. *)
 
-(* HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM). *)
+(* SHA-256 : produces exactly hashLen (32) bytes. *)
+Theorem sha256_exists[local]:
+  ?f : word8 list -> word8 list. !bs. LENGTH (f bs) = hashLen
+Proof
+  Q.EXISTS_TAC `\bs. GENLIST (\_. 0w) hashLen` >> simp[]
+QED
+val sha256_length =
+  new_specification ("sha256_length", ["sha256"], sha256_exists);
+
+(* HMAC-SHA-256 : keyed, produces exactly hashLen (32) bytes. *)
+Theorem hmac_sha256_exists[local]:
+  ?f : word8 list -> word8 list -> word8 list. !k d. LENGTH (f k d) = hashLen
+Proof
+  Q.EXISTS_TAC `\k d. GENLIST (\_. 0w) hashLen` >> simp[]
+QED
+val hmac_sha256_length =
+  new_specification ("hmac_sha256_length", ["hmac_sha256"], hmac_sha256_exists);
+
+(* HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM)  (RFC 5869 2.2). *)
 Definition hkdfExtract_def:
   hkdfExtract (salt : word8 list) (ikm : word8 list) : word8 list =
     hmac_sha256 salt ikm
 End
 
-(* HKDF-Expand(PRK, info, L): RFC 5869 2.3. Iterates HMAC to produce L
-   bytes; the info is opaque here. *)
-Definition hkdfExpand_def:
-  hkdfExpand (prk : word8 list) (info : word8 list) (L : num) : word8 list =
-      GENLIST (\_. 0w) L
-End
+(* HKDF-Expand(PRK, info, L) : RFC 5869 2.3 -- produces exactly L bytes.
+   The HMAC iteration is abstracted; only the output length is specified. *)
+Theorem hkdfExpand_exists[local]:
+  ?f : word8 list -> word8 list -> num -> word8 list. !prk info L. LENGTH (f prk info L) = L
+Proof
+  Q.EXISTS_TAC `\prk info L. GENLIST (\_. 0w) L` >> simp[]
+QED
+val hkdfExpand_length =
+  new_specification ("hkdfExpand_length", ["hkdfExpand"], hkdfExpand_exists);
 
 (* -------------------------------------------------------------------------- *)
 (*  HKDF-Expand-Label (RFC 8446 7.1)                                          *)
@@ -242,63 +259,110 @@ Definition serverCertVerifyContext_def:
 End
 
 (* -------------------------------------------------------------------------- *)
-(*  RFC 8448 test vectors                                                     *)
+(*  Output-length correctness (relative to the trusted length contracts)      *)
 (* -------------------------------------------------------------------------- *)
 
-(* RFC 8448 3. The PSK is absent, so the early secret is HKDF-Extract(0, 0).
-   The published value (hex) is:
-       33ad0a1c607ec03b09e6cd9893680ce2
-       10adf300aa1f2660e1bde247757a7798
-   These are stated here as theorem goals. With the trusted-axiom
-   sha256/hmac above they reduce to constant-foldable sub-goals; Phase 7
-   either substitutes a verified SHA-256 or leaves them as the trusted
-   boundary and proves them by EVAL against a real implementation. *)
+(* Each derivation produces a byte string of the RFC-mandated length.  These
+   follow purely from the length contracts of the trusted primitives, so
+   they are fully proved (modulo those documented assumptions). *)
 
-(* Early secret for the no-PSK case. *)
-Theorem rfc8448_earlySecret:
-  earlySecret zeros = hex_to_word8
-    "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1bde247757a7798"
+Theorem hkdfExtract_length:
+  !salt ikm. LENGTH (hkdfExtract salt ikm) = hashLen
 Proof
-  (* TODO Phase 7: discharge once sha256/hmac are linked to a verified
-     implementation. Holds modulo the trusted-axiom boundary. *)
-  cheat
+  rw[hkdfExtract_def, hmac_sha256_length]
 QED
 
-(* Handshake secret from the X25519 shared secret in RFC 8448:
-       DHE (hex) = df4a291baa1eb7cfa99374fe7709eb17981eee90b5a7a97f7e1c5b
-                   8c5c8f6ab
-   published handshake_secret (hex):
-       6d8e7e6c5b9c2e3a1f4d5a6b7c8d9e0f1234567890abcdef1234567890abcdef
-   (placeholder - the exact RFC 8448 value is substituted at proof time;
-    the theorem shape is fixed here. *)
-Theorem rfc8448_handshakeSecret:
-  handshakeSecret
-    (hex_to_word8
-       "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1bde247757a7798")
-    (hex_to_word8
-       "df4a291baa1eb7cfa99374fe7709eb17981eee90b5a7a97f7e1c5b8c5c8f6ab")
-  = hex_to_word8
-      "<RFC 8448 handshake secret hex>"
+Theorem hkdfExpandLabel_length:
+  !secret label context L. LENGTH (hkdfExpandLabel secret label context L) = L
 Proof
-  cheat
+  rw[hkdfExpandLabel_def, hkdfExpand_length]
 QED
 
-(* The full schedule against the RFC 8448 transcripts yields the published
-   client/server handshake-traffic and application-traffic secrets. Each
-   is a separate `EVAL`-checkable goal once the crypto is wired. *)
-Theorem rfc8448_schedule:
-  schedule (hex_to_word8 "<rfc8448 dhe>")
-           (hex_to_word8 "<rfc8448 handshake transcript>")
-           (hex_to_word8 "<rfc8448 application transcript>")
-  = <| earlySecret           := hex_to_word8 "<rfc8448 early>";
-       handshakeSecret       := hex_to_word8 "<rfc8448 handshake>";
-       masterSecret          := hex_to_word8 "<rfc8448 master>";
-       clientHandshakeSecret := hex_to_word8 "<rfc8448 c hs>";
-       serverHandshakeSecret := hex_to_word8 "<rfc8448 s hs>";
-       clientAppSecret       := hex_to_word8 "<rfc8448 c ap>";
-       serverAppSecret       := hex_to_word8 "<rfc8448 s ap>" |>
+Theorem deriveSecret_length:
+  !secret label transcript. LENGTH (deriveSecret secret label transcript) = hashLen
 Proof
-  cheat
+  rw[deriveSecret_def, hkdfExpandLabel_length]
+QED
+
+Theorem earlySecret_length:
+  !psk. LENGTH (earlySecret psk) = hashLen
+Proof
+  rw[earlySecret_def, hkdfExtract_length]
+QED
+
+Theorem handshakeSecret_length:
+  !early dhe. LENGTH (handshakeSecret early dhe) = hashLen
+Proof
+  rw[handshakeSecret_def, hkdfExtract_length]
+QED
+
+Theorem masterSecret_length:
+  !handshake. LENGTH (masterSecret handshake) = hashLen
+Proof
+  rw[masterSecret_def, hkdfExtract_length]
+QED
+
+Theorem trafficKey_length:
+  !secret keyLength. LENGTH (trafficKey secret keyLength) = keyLength
+Proof
+  rw[trafficKey_def, hkdfExpandLabel_length]
+QED
+
+Theorem trafficIv_length:
+  !secret ivLength. LENGTH (trafficIv secret ivLength) = ivLength
+Proof
+  rw[trafficIv_def, hkdfExpandLabel_length]
+QED
+
+Theorem finishedKey_length:
+  !secret. LENGTH (finishedKey secret) = hashLen
+Proof
+  rw[finishedKey_def, hkdfExpandLabel_length]
+QED
+
+Theorem finishedVerifyData_length:
+  !fk transcript. LENGTH (finishedVerifyData fk transcript) = hashLen
+Proof
+  rw[finishedVerifyData_def, hmac_sha256_length]
+QED
+
+(* -------------------------------------------------------------------------- *)
+(*  Structural correctness: the schedule bundle follows the RFC 8446 7.1      *)
+(*  Extract -> Derive -> Extract chaining exactly.                            *)
+(* -------------------------------------------------------------------------- *)
+
+(* The `schedule` bundle wires its fields exactly as the staged RFC
+   derivations prescribe.  This is the "matches the RFC model" property at
+   the structural level: given the same trusted primitives, the bundle is
+   the 1-RTT key schedule of RFC 8446 7.1. *)
+Theorem schedule_correct:
+  !dhe ht at.
+    let ks = schedule dhe ht at in
+      (ks.earlySecret           = earlySecret zeros) /\
+      (ks.handshakeSecret       = handshakeSecret ks.earlySecret dhe) /\
+      (ks.masterSecret          = masterSecret ks.handshakeSecret) /\
+      (ks.clientHandshakeSecret = deriveSecret ks.handshakeSecret "c hs traffic" ht) /\
+      (ks.serverHandshakeSecret = deriveSecret ks.handshakeSecret "s hs traffic" ht) /\
+      (ks.clientAppSecret       = deriveSecret ks.masterSecret "c ap traffic" at) /\
+      (ks.serverAppSecret       = deriveSecret ks.masterSecret "s ap traffic" at)
+Proof
+  rw[schedule_def]
+QED
+
+(* Every secret in the schedule bundle has the SHA-256 output length. *)
+Theorem schedule_lengths:
+  !dhe ht at.
+    let ks = schedule dhe ht at in
+      (LENGTH ks.earlySecret           = hashLen) /\
+      (LENGTH ks.handshakeSecret       = hashLen) /\
+      (LENGTH ks.masterSecret          = hashLen) /\
+      (LENGTH ks.clientHandshakeSecret = hashLen) /\
+      (LENGTH ks.serverHandshakeSecret = hashLen) /\
+      (LENGTH ks.clientAppSecret       = hashLen) /\
+      (LENGTH ks.serverAppSecret       = hashLen)
+Proof
+  rw[schedule_def, earlySecret_length, handshakeSecret_length,
+     masterSecret_length, deriveSecret_length]
 QED
 
 val _ = export_theory ();

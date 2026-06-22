@@ -86,6 +86,75 @@ Definition w16_to_bytes_def:
 End
 
 (* -------------------------------------------------------------------------- *)
+(*  Word reconstruction lemmas (proved by bit-blasting / w2n arithmetic)      *)
+(* -------------------------------------------------------------------------- *)
+
+(* A 16-bit word survives the split-into-bytes / reassemble round-trip. *)
+Theorem w16_of_to_bytes:
+  !w:word16. w16_of_bytes (w8_of_w16_hi w) (w8_of_w16_lo w) = w
+Proof
+  rw[w16_of_bytes_def, w8_of_w16_hi_def, w8_of_w16_lo_def] >>
+  blastLib.BBLAST_TAC
+QED
+
+(* Encoding a length < 2^16 as two bytes and reading it back yields the
+   length unchanged. *)
+Theorem w16_len_roundtrip:
+  !len. len < 65536 ==>
+        w2n (w16_of_bytes (w8_of_w16_hi (n2w len)) (w8_of_w16_lo (n2w len))) = len
+Proof
+  rw[w16_of_to_bytes] >>
+  simp[w2n_n2w] >>
+  `dimword (:16) = 65536` by EVAL_TAC >>
+  simp[]
+QED
+
+(* A 24-bit value held in a word32 survives split/reassemble.  The bound
+   gives the bit-blaster the information that the top byte is zero. *)
+Theorem w24_recon:
+  !w:word32. w <+ 0x1000000w ==>
+     w24_of_len3 (w2w (w >>> 16)) (w2w (w >>> 8)) (w2w w) = w
+Proof
+  rw[w24_of_len3_def] >> rpt strip_tac >> blastLib.FULL_BBLAST_TAC
+QED
+
+(* n2w absorbs a redundant MOD 256 at type word8 (dimword(:8) = 256). *)
+Theorem n2w_mod256:
+  !a. (n2w (a MOD 256) : word8) = n2w a
+Proof
+  strip_tac >> `256 = dimword (:8)` by EVAL_TAC >> pop_assum SUBST1_TAC >>
+  simp[n2w_mod]
+QED
+
+(* Encoding a length < 2^24 as three big-endian bytes and reading it back
+   yields the length unchanged. *)
+Theorem len3_w24_roundtrip:
+  !len. len < 16777216 ==>
+    w2n (w24_of_len3 (n2w ((len DIV 65536) MOD 256))
+                     (n2w ((len DIV 256) MOD 256))
+                     (n2w (len MOD 256))) = len
+Proof
+  rpt strip_tac >>
+  `dimword (:32) = 4294967296` by EVAL_TAC >>
+  `(2:num) ** 16 = 65536` by EVAL_TAC >>
+  `(2:num) ** 8 = 256` by EVAL_TAC >>
+  `len MOD dimword (:32) = len` by simp[arithmeticTheory.LESS_MOD] >>
+  `dimword (:8) = 256` by EVAL_TAC >>
+  `w24_of_len3 (n2w ((len DIV 65536) MOD 256))
+               (n2w ((len DIV 256) MOD 256))
+               (n2w (len MOD 256)) = (n2w len : word32)` by (
+     `(n2w ((len DIV 65536) MOD 256) : word8) = w2w ((n2w len : word32) >>> 16)` by
+        simp[w2w_def, w2n_lsr, w2n_n2w, arithmeticTheory.MOD_MOD] >>
+     `(n2w ((len DIV 256) MOD 256) : word8) = w2w ((n2w len : word32) >>> 8)` by
+        simp[w2w_def, w2n_lsr, w2n_n2w, arithmeticTheory.MOD_MOD] >>
+     `(n2w (len MOD 256) : word8) = w2w (n2w len : word32)` by
+        simp[w2w_def, w2n_n2w, arithmeticTheory.MOD_MOD] >>
+     ASM_REWRITE_TAC[] >> irule w24_recon >>
+     simp[WORD_LO, w2n_n2w]) >>
+  simp[w2n_n2w]
+QED
+
+(* -------------------------------------------------------------------------- *)
 (*  Content type (RFC 8446 5.1 / 5.2)                                         *)
 (* -------------------------------------------------------------------------- *)
 
@@ -119,7 +188,7 @@ End
 Theorem decode_encode_contentType:
   !ct. decodeContentType (encodeContentType ct) = SOME ct
 Proof
-  cheat
+  Cases >> EVAL_TAC
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -167,11 +236,21 @@ End
 (* Round-trip: decoding an encoded record returns the record and no
    remainder. Provable by EVAL on concrete records; the general case
    reduces to list arithmetic. *)
+(* The 16-bit length field caps a fragment at 2^16-1 bytes (TLS itself caps
+   records well below this, at 2^14); under that bound the round-trip holds. *)
 Theorem decode_encode_plaintext:
-  !r. decodePlaintext (encodePlaintext r) = SOME (r, [])
+  !r. LENGTH r.fragment < 65536 ==>
+      decodePlaintext (encodePlaintext r) = SOME (r, [])
 Proof
-  (* TODO: discharge in Phase 7; the case-splits are mechanical. *)
-  cheat
+  strip_tac >> strip_tac >>
+  `encodePlaintext r =
+     encodeContentType r.contentType ::
+     w8_of_w16_hi legacyVersion :: w8_of_w16_lo legacyVersion ::
+     w8_of_w16_hi (n2w (LENGTH r.fragment)) ::
+     w8_of_w16_lo (n2w (LENGTH r.fragment)) :: r.fragment`
+    by simp[encodePlaintext_def, w16_to_bytes_def] >>
+  simp[decodePlaintext_def, decode_encode_contentType, w16_len_roundtrip] >>
+  simp[TAKE_LENGTH_ID, DROP_LENGTH_NIL, fetch "-" "tlsPlaintext_component_equality"]
 QED
 
 (* Ciphertext framing is identical in shape (outer type is always
@@ -199,9 +278,18 @@ Definition decodeCiphertext_def:
 End
 
 Theorem decode_encode_ciphertext:
-  !r. decodeCiphertext (encodeCiphertext r) = SOME (r, [])
+  !r. LENGTH r.encryptedRecord < 65536 ==>
+      decodeCiphertext (encodeCiphertext r) = SOME (r, [])
 Proof
-  cheat
+  strip_tac >> strip_tac >>
+  `encodeCiphertext r =
+     encodeContentType r.contentType ::
+     w8_of_w16_hi legacyVersion :: w8_of_w16_lo legacyVersion ::
+     w8_of_w16_hi (n2w (LENGTH r.encryptedRecord)) ::
+     w8_of_w16_lo (n2w (LENGTH r.encryptedRecord)) :: r.encryptedRecord`
+    by simp[encodeCiphertext_def, w16_to_bytes_def] >>
+  simp[decodeCiphertext_def, decode_encode_contentType, w16_len_roundtrip] >>
+  simp[TAKE_LENGTH_ID, DROP_LENGTH_NIL, fetch "-" "tlsCiphertext_component_equality"]
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -256,7 +344,7 @@ End
 Theorem decode_encode_handshakeType:
   !t. decodeHandshakeType (encodeHandshakeType t) = SOME t
 Proof
-  cheat
+  Cases >> EVAL_TAC
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -291,10 +379,21 @@ Definition decodeMessage_def:
                        DROP (4 + n) bs)
 End
 
+(* The 24-bit length field caps a handshake body at 2^24-1 bytes (the RFC
+   8446 limit); under that bound the round-trip holds. *)
 Theorem decode_encode_message:
-  !m. decodeMessage (encodeMessage m) = SOME (m, [])
+  !m. LENGTH m.body < 16777216 ==>
+      decodeMessage (encodeMessage m) = SOME (m, [])
 Proof
-  cheat
+  strip_tac >> strip_tac >>
+  `encodeMessage m =
+     encodeHandshakeType m.msgType ::
+     n2w ((LENGTH m.body DIV 65536) MOD 256) ::
+     n2w ((LENGTH m.body DIV 256) MOD 256) ::
+     n2w (LENGTH m.body MOD 256) :: m.body`
+    by simp[encodeMessage_def, len3_def] >>
+  simp[decodeMessage_def, decode_encode_handshakeType, len3_w24_roundtrip] >>
+  simp[TAKE_LENGTH_ID, DROP_LENGTH_NIL, fetch "-" "handshakeMessage_component_equality"]
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -347,10 +446,37 @@ Definition decodeExtensions_def:
       else decodeExts_loop (TAKE total (DROP 2 bs)) []
 End
 
-Theorem decode_encode_extensions:
-  !es. decodeExtensions (encodeExtensions es) = SOME es
+(* The loop is correct: parsing the concatenation of encoded extensions
+   recovers them in order (modulo the reverse-accumulator), provided each
+   extension's data fits in the 2-byte length field. *)
+Theorem decodeExts_loop_correct:
+  !es acc.
+    EVERY (\e. LENGTH e.data < 65536) es ==>
+    decodeExts_loop (FLAT (MAP encodeExtension es)) acc = SOME (REVERSE acc ++ es)
 Proof
-  cheat
+  Induct
+  >- simp[decodeExts_loop_def]
+  >> rpt strip_tac
+  >> fs[]
+  >> simp[encodeExtension_def, w16_to_bytes_def]
+  >> simp[decodeExts_loop_def, w16_of_to_bytes, w16_len_roundtrip,
+          rich_listTheory.TAKE_LENGTH_APPEND, rich_listTheory.DROP_LENGTH_APPEND]
+  >> simp[fetch "-" "extension_component_equality"]
+QED
+
+(* Full extension-block round-trip.  Two honest bounds: each extension's
+   data is < 2^16 bytes, and the concatenated block is < 2^16 bytes (both
+   enforced by the 2-byte length fields on the wire). *)
+Theorem decode_encode_extensions:
+  !es. EVERY (\e. LENGTH e.data < 65536) es /\
+       LENGTH (FLAT (MAP encodeExtension es)) < 65536 ==>
+       decodeExtensions (encodeExtensions es) = SOME es
+Proof
+  rpt strip_tac >>
+  simp[decodeExtensions_def, encodeExtensions_def, w16_to_bytes_def] >>
+  simp[w16_of_to_bytes, w16_len_roundtrip, rich_listTheory.TAKE_LENGTH_APPEND,
+       rich_listTheory.DROP_LENGTH_APPEND] >>
+  simp[decodeExts_loop_correct]
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -408,87 +534,79 @@ Datatype:
        extensions     : extension list |>
 End
 
-(* Encoders/decoders for the bodies above are the mechanical mirror of the
-   SML functions in tls.sml. Their implementations are filled in Phase 7
-   (or by sub-worker 1's follow-up); the function signatures are fixed
-   here as trusted axioms so the round-trip goals below type-check. *)
+(* --- Finished (RFC 8446 4.4.4) -----------------------------------------
 
-Definition encodeClientHello_def:
-  encodeClientHello (ch : clientHello) : word8 list = []
-End
-Definition decodeClientHello_def:
-  decodeClientHello (bs : word8 list) : clientHello option = NONE
-End
-
-Definition encodeServerHello_def:
-  encodeServerHello (sh : serverHello) : word8 list = []
-End
-Definition decodeServerHello_def:
-  decodeServerHello (bs : word8 list) : serverHello option = NONE
-End
-
-Definition encodeCertificate_def:
-  encodeCertificate (c : certificate) : word8 list = []
-End
-Definition decodeCertificate_def:
-  decodeCertificate (bs : word8 list) : certificate option = NONE
-End
-
-Definition encodeCertificateVerify_def:
-  encodeCertificateVerify (cv : certificateVerify) : word8 list = []
-End
-Definition decodeCertificateVerify_def:
-  decodeCertificateVerify (bs : word8 list) : certificateVerify option = NONE
-End
+   The Finished body is exactly verify_data (no internal framing); its
+   length is fixed by the hash and is always non-empty.  This mirrors the
+   SML `encodeFinished`/`decodeFinished` in tls.sml, which return NONE on an
+   empty input. *)
 
 Definition encodeFinished_def:
-  encodeFinished (f : finished) : word8 list = []
+  encodeFinished (f : finished) : word8 list = f.verifyData
 End
 Definition decodeFinished_def:
-  decodeFinished (bs : word8 list) : finished option = NONE
+  decodeFinished (bs : word8 list) : finished option =
+    if bs = [] then NONE else SOME <| verifyData := bs |>
 End
-
-Definition encodeNewSessionTicket_def:
-  encodeNewSessionTicket (nst : newSessionTicket) : word8 list = []
-End
-Definition decodeNewSessionTicket_def:
-  decodeNewSessionTicket (bs : word8 list) : newSessionTicket option = NONE
-End
-
-Theorem clientHello_roundtrip:
-  !ch. decodeClientHello (encodeClientHello ch) = SOME ch
-Proof
-  cheat
-QED
-
-Theorem serverHello_roundtrip:
-  !sh. decodeServerHello (encodeServerHello sh) = SOME sh
-Proof
-  cheat
-QED
-
-Theorem certificate_roundtrip:
-  !c. decodeCertificate (encodeCertificate c) = SOME c
-Proof
-  cheat
-QED
-
-Theorem certificateVerify_roundtrip:
-  !cv. decodeCertificateVerify (encodeCertificateVerify cv) = SOME cv
-Proof
-  cheat
-QED
 
 Theorem finished_roundtrip:
-  !f. decodeFinished (encodeFinished f) = SOME f
+  !f. f.verifyData <> [] ==> decodeFinished (encodeFinished f) = SOME f
 Proof
-  cheat
+  rw[encodeFinished_def, decodeFinished_def] >>
+  simp[fetch "-" "finished_component_equality"]
 QED
 
-Theorem newSessionTicket_roundtrip:
-  !nst. decodeNewSessionTicket (encodeNewSessionTicket nst) = SOME nst
+(* --- CertificateVerify (RFC 8446 4.4.3) --------------------------------
+
+   Wire form: [sigAlg:2][sigLen:2][signature].  Mirrors the SML
+   `encodeCertificateVerify`/`decodeCertificateVerify`. *)
+
+Definition encodeCertificateVerify_def:
+  encodeCertificateVerify (cv : certificateVerify) : word8 list =
+    w16_to_bytes cv.sigAlg ++
+    w16_to_bytes (n2w (LENGTH cv.sigBytes) : word16) ++
+    cv.sigBytes
+End
+Definition decodeCertificateVerify_def:
+  decodeCertificateVerify (bs : word8 list) : certificateVerify option =
+    if LENGTH bs < 4 then NONE
+    else
+      let sigAlg = w16_of_bytes (EL 0 bs) (EL 1 bs) in
+      let n      = w2n (w16_of_bytes (EL 2 bs) (EL 3 bs)) in
+      if LENGTH bs < 4 + n then NONE
+      else SOME <| sigAlg := sigAlg; sigBytes := TAKE n (DROP 4 bs) |>
+End
+
+Theorem certificateVerify_roundtrip:
+  !cv. LENGTH cv.sigBytes < 65536 ==>
+       decodeCertificateVerify (encodeCertificateVerify cv) = SOME cv
 Proof
-  cheat
+  strip_tac >> strip_tac >>
+  `encodeCertificateVerify cv =
+     w8_of_w16_hi cv.sigAlg :: w8_of_w16_lo cv.sigAlg ::
+     w8_of_w16_hi (n2w (LENGTH cv.sigBytes)) ::
+     w8_of_w16_lo (n2w (LENGTH cv.sigBytes)) :: cv.sigBytes`
+    by simp[encodeCertificateVerify_def, w16_to_bytes_def] >>
+  simp[decodeCertificateVerify_def, w16_of_to_bytes, w16_len_roundtrip] >>
+  simp[TAKE_LENGTH_ID, fetch "-" "certificateVerify_component_equality"]
 QED
+
+(* --- ClientHello / ServerHello / Certificate / NewSessionTicket --------
+
+   These structures carry nested, length-prefixed vectors and *lists* of
+   sub-structures (cipher-suite lists, an extension block whose presence is
+   optional, and -- for Certificate -- a list of CertificateEntry each with
+   its own 3-byte length prefix and extension block).  Their SML encoders /
+   decoders in tls.sml are NOT clean inverses in all cases (e.g. an absent
+   trailing extension block decodes to []), so an unconditional round-trip
+   theorem does not hold without additional well-formedness side conditions.
+
+   To keep this theory SOUND we do NOT state placeholder `cheat` round-trip
+   theorems for them (a `cheat` on a non-theorem would make tls_wireTheory
+   inconsistent).  The datatypes above record the intended model; the
+   mechanized codecs and their conditional round-trip proofs are tracked as
+   open work in proof/PROOF_STATUS.md.  The reusable framing layer needed to
+   discharge them (the record/handshake/extension round-trips above) is
+   fully proved. *)
 
 val _ = export_theory ();
