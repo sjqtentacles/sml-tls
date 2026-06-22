@@ -4,5 +4,8 @@ $(SML_LIB)/basis/basis.mlb
 
 harness.sml
 test.sml
+record.sml
+cert.sml
+ext.sml
 entry.sml
 main.sml

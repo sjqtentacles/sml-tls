@@ -1,6 +1,9 @@
 fun runAllSuites () =
   ( Harness.reset ()
   ; TlsTests.run ()
+  ; RecordTests.run ()
+  ; CertTests.run ()
+  ; ExtTests.run ()
   ; Harness.run () )
 
 fun main () =

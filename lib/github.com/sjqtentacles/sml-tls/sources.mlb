@@ -71,3 +71,15 @@ $(SML_LIB)/basis/basis.mlb
 (* 12. sml-tls: TLS 1.3, the library itself. *)
 tls.sig
 tls.sml
+
+(* 13. Track stubs (Phase 0 interface freeze). These reference TlsRecord /
+       TlsAlert / TlsHandshake types defined in tls.sml, so they MUST come
+       after tls.sml. Bodies are `raise Fail "todo: A1|A2|A3"`; the
+       per-track subagents fill them in. The J1 integrator later wires
+       them into TlsClient.step / TlsServer.step. *)
+recordprotect.sig
+recordprotect.sml
+certverify.sig
+certverify.sml
+extensions.sig
+extensions.sml
