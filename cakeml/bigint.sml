@@ -171,10 +171,11 @@ structure BigInt = struct
                     let
                       val cur = Array.sub res (i + j)
                       val (plo, phi) = mul32c ai (Vector.sub b j)
-                      val prod = Word64.+ (Word64.+ (Word64.+ plo phi) cur) carry
+                      val prod = Word64.+ (Word64.+ plo cur) carry
+                      val newCarry = Word64.+ phi (Word64.>> prod 32)
                     in
                       Array.update res (i + j) (Word64.andb prod mask32);
-                      inner (j + 1, Word64.>> prod 32)
+                      inner (j + 1, newCarry)
                     end
               in
                 inner (0, 0w0); outer (i + 1)
@@ -188,8 +189,8 @@ structure BigInt = struct
   fun shiftLimbs (v, k) =
 
     if Vector.length v = 0 then empty
-    else Vector.tabulate (Vector.length v + k,
-            fn i => if i < k then 0w0 else Vector.sub v (i - k))
+    else Vector.tabulate (Vector.length v + k)
+            (fn i => if i < k then 0w0 else Vector.sub v (i - k))
 
   (* Low [m] limbs / the rest, as a (low, high) split. *)
   fun splitAt (v, m) =
@@ -214,14 +215,14 @@ structure BigInt = struct
       then magMulSchool (a, b)
       else
         let
-          val m = (Int.max la lb + 1) div 2
+          val m = ((if la >= lb then la else lb) + 1) div 2
           val (a0, a1) = splitAt (a, m)
           val (b0, b1) = splitAt (b, m)
           val z0 = magMul (a0, b0)
           val z2 = magMul (a1, b1)
-          val z1 = magSub (magSub (magMul (magAdd (a0, a1), magAdd (b0, b1))) z2) z0
+          val z1 = magSub (magSub (magMul (magAdd (a0, a1), magAdd (b0, b1)), z2), z0)
         in
-          magAdd (magAdd (shiftLimbs (z2, 2 * m), shiftLimbs (z1, m)) ) z0
+          magAdd (magAdd (shiftLimbs (z2, 2 * m), shiftLimbs (z1, m)), z0)
         end
     end
 
@@ -297,7 +298,7 @@ structure BigInt = struct
       in
         if bitShift = 0
         then normVec (Vector.tabulate (n + limbShift)
-               fn i => if i < limbShift then 0w0 else Vector.sub v (i - limbShift))
+               (fn i => if i < limbShift then 0w0 else Vector.sub v (i - limbShift)))
         else
           normVec (Vector.tabulate (n + limbShift + 1) (fn i =>
             if i < limbShift then 0w0
@@ -376,11 +377,11 @@ structure BigInt = struct
   fun magGcd (a, b) =
 
     let
-      val shift = Int.min (trailingZeros a, trailingZeros b)
+      val shift = let val ta = trailingZeros a; val tb = trailingZeros b in if ta <= tb then ta else tb end
       fun loop (u, v) =
         let
           val v2 = shrBits (v, trailingZeros v)
-          val (u2, v3) = if magCompare u v2 = Greater then (v2, u) else (u, v2)
+          val (u2, v3) = if magCompare (u, v2) = Greater then (v2, u) else (u, v2)
           val d = magSub (v3, u2)
         in
           if magIsZero d then u2 else loop (u2, d)
@@ -392,12 +393,14 @@ structure BigInt = struct
 
   (* ===== sign-magnitude layer ===== *)
 
-  datatype bigint = BI of int * mag   (* sign in {~1,0,1}, magnitude *)
+  exception Domain
 
-  fun mk (sgn, m) = if magIsZero m then BI (0, empty) else BI (sgn, m)
+datatype bigint = BI int mag   (* sign in {~1,0,1}, magnitude *)
 
-  val zeroB = BI (0, empty)
-  val oneB  = BI (1, Vector.fromList [0w1])
+  fun mk (sgn, m) = if magIsZero m then BI 0 empty else BI sgn m
+
+  val zeroB = BI 0 empty
+  val oneB  = BI 1 (Vector.fromList [0w1])
 
   (* ----- conversions ----- *)
 
@@ -406,12 +409,12 @@ structure BigInt = struct
     else
       let
         val sgn = if n < 0 then ~1 else 1
+        val nn = if n < 0 then ~n else n
         (* base-2^16 chunks, most significant first (built by prepending) *)
-        fun chunks (n, acc) =
-          if n = 0 then acc
-          else chunks (n div 65536,
-                       Word64.fromInt (abs (n mod 65536)) :: acc)
-        val hiToLo = chunks (n, [])
+        fun chunks (m, acc) =
+          if m = 0 then acc
+          else chunks (m div 65536, Word64.fromInt (m mod 65536) :: acc)
+        val hiToLo = chunks (nn, [])
         val loToHi = List.rev hiToLo
         (* pack pairs of 16-bit chunks into 32-bit limbs *)
         fun pack (xs, acc) =
@@ -426,7 +429,7 @@ structure BigInt = struct
       end
 
   (* CakeML int is bignum, so projection never overflows. *)
-  fun toInt (BI (sgn, mag)) =
+  fun toInt (BI sgn mag) =
     let
       fun horner (acc, w) =
         let
@@ -443,7 +446,7 @@ structure BigInt = struct
 
   (* ----- comparison / sign / abs ----- *)
 
-  fun compare (BI (sa, ma), BI (sb, mb)) =
+  fun compare (BI sa ma, BI sb mb) =
     if sa <> sb then Int.compare sa sb
     else
       case sa of
@@ -451,15 +454,15 @@ structure BigInt = struct
         | 1 => magCompare (ma, mb)
         | _ => magCompare (mb, ma)
 
-  fun sign (BI (s, _)) = fromInt s
-  fun absB (BI (s, m)) = if s = 0 then zeroB else BI (1, m)
-  fun negate (BI (s, m)) = BI (~s, m)
+  fun sign (BI s _) = fromInt s
+  fun absB (BI s m) = if s = 0 then zeroB else BI 1 m
+  fun negate (BI s m) = BI (~s) m
 
   (* ----- additive arithmetic ----- *)
 
-  fun add (BI (sa, ma), BI (sb, mb)) =
-    if sa = 0 then BI (sb, mb)
-    else if sb = 0 then BI (sa, ma)
+  fun add (BI sa ma, BI sb mb) =
+    if sa = 0 then BI sb mb
+    else if sb = 0 then BI sa ma
     else if sa = sb then mk (sa, magAdd (ma, mb))
     else
       case magCompare (ma, mb) of
@@ -469,13 +472,13 @@ structure BigInt = struct
 
   fun sub (a, b) = add (a, negate b)
 
-  fun mul (BI (sa, ma), BI (sb, mb)) =
+  fun mul (BI sa ma, BI sb mb) =
     if sa = 0 orelse sb = 0 then zeroB
     else mk (sa * sb, magMul (ma, mb))
 
   (* ----- division ----- *)
 
-  fun quotRem (BI (sa, ma), BI (sb, mb)) =
+  fun quotRem (BI sa ma, BI sb mb) =
     if sb = 0 then raise Div
     else if sa = 0 then (zeroB, zeroB)
     else
@@ -485,14 +488,14 @@ structure BigInt = struct
         (mk (sa * sb, q), mk (sa, r))
       end
 
-  fun divMod (a as BI (sa, _), b as BI (sb, _)) =
+  fun divMod (a as BI sa _, b as BI sb _) =
     if sb = 0 then raise Div
     else
       let
         val (q, r) = quotRem (a, b)
       in
         case r of
-            BI (0, _) => (q, r)
+            BI 0 _ => (q, r)
           | _ => if sa = sb then (q, r)
                  else (sub (q, oneB), add (r, b))
       end
@@ -507,12 +510,12 @@ structure BigInt = struct
     let
       val rI = case toInt radix of Some r => r | None => raise Domain
       val () = if rI < 2 orelse rI > 36 then raise Domain else ()
-      val BI (sgn, mag) = n
+      val BI sgn mag = n
     in
       if sgn = 0 then "0"
       else
         let
-          val rMag = case radix of BI (_, m) => m
+          val rMag = case radix of BI _ m => m
           fun loop (m, acc) =
             if magIsZero m then acc
             else
@@ -572,7 +575,7 @@ structure BigInt = struct
 
   fun pow (b, e) =
     let
-      val BI (se, me) = e
+      val BI se me = e
     in
       if se < 0 then raise Domain
       else if se = 0 then oneB
@@ -591,17 +594,17 @@ structure BigInt = struct
 
   fun gcd (a, b) =
     let
-      val BI (sa, ma) = absB a
-      val BI (sb, mb) = absB b
+      val BI sa ma = absB a
+      val BI sb mb = absB b
     in
       if sa = 0 then absB b
       else if sb = 0 then absB a
-      else BI (1, magGcd (ma, mb))
+      else BI 1 (magGcd (ma, mb))
     end
 
   fun modpow (b, e, m) =
     let
-      val BI (se, me) = e
+      val BI se me = e
     in
       if se < 0 then raise Domain
       else
@@ -631,20 +634,20 @@ structure BigInt = struct
 
     if i < Vector.length m then Vector.sub m i else 0w0
 
-  fun tcView (BI (s, m)) =
+  fun tcView (BI s m) =
     if s >= 0 then (False, fn i => magLimb (m, i))
     else
       let val m1 = magSub (m, oneMag)
       in (True, fn i => notb (magLimb (m1, i))) end
 
-  fun bitwise opf (a as BI (_, ma), b as BI (_, mb)) =
+  fun bitwise opf (a as BI _ ma, b as BI _ mb) =
     let
       val (na, fa) = tcView a
       val (nb, fb) = tcView b
       val extA : limb = if na then mask32 else 0w0
       val extB : limb = if nb then mask32 else 0w0
       val resNeg = Word64.= (opf extA extB) mask32
-      val n = Int.max (Vector.length ma, Vector.length mb) + 1
+      val n = let val la = Vector.length ma; val lb = Vector.length mb in if la >= lb then la else lb end + 1
       val r = Array.tabulate n (fn i => opf (fa i) (fb i))
     in
       if not resNeg then mk (1, normArr r)
@@ -668,12 +671,12 @@ structure BigInt = struct
 
   fun shlB (n, k) =
     if k < 0 then raise Domain
-    else let val BI (s, m) = n in mk (s, shlBits (m, k)) end
+    else let val BI s m = n in mk (s, shlBits (m, k)) end
 
   fun shrB (n, k) =
     if k < 0 then raise Domain
     else
-      let val BI (s, m) = n
+      let val BI s m = n
       in
         if s >= 0 then mk (s, shrBits (m, k))
         else
@@ -685,7 +688,7 @@ structure BigInt = struct
           end
       end
 
-  fun bitLengthOf (BI (_, m)) = bitLength m
+  fun bitLengthOf (BI _ m) = bitLength m
 
   fun bitB (n, i) =
     if i < 0 then raise Domain
@@ -703,7 +706,7 @@ structure BigInt = struct
 
   fun popcountB n =
     let
-      val BI (_, m) = absB n
+      val BI _ m = absB n
       fun limbPop (w, acc) =
         if Word64.= w 0w0 then acc
         else limbPop (Word64.>> w 1,
@@ -725,15 +728,15 @@ structure BigInt = struct
             val x0 = shlB (oneB, (bl + 1) div 2)
             fun loop x =
               let val (q1, _) = divMod (n, x)
-                  val (s, _) = divMod (add (x, q1)) (fromInt 2)
-              in if compare s x = Less then loop s else x end
+                  val (s, _) = divMod (add (x, q1), fromInt 2)
+              in if compare (s, x) = Less then loop s else x end
           in loop x0 end
 
   fun nthRootB (k, n) =
     if k < 1 then raise Domain
-    else if compare n zeroB = Less then raise Domain
+    else if compare (n, zeroB) = Less then raise Domain
     else if k = 1 then n
-    else if compare n zeroB = Equal then zeroB
+    else if compare (n, zeroB) = Equal then zeroB
     else if k = 2 then isqrtB n
     else
       let
@@ -745,19 +748,19 @@ structure BigInt = struct
           let
             val xk1 = pow (x, km1)
             val (q1, _) = divMod (n, xk1)
-            val (s, _) = divMod (add (mul (km1, x), q1)) kB
-          in if compare s x = Less then newton s else x end
+            val (s, _) = divMod (add (mul (km1, x), q1), kB)
+          in if compare (s, x) = Less then newton s else x end
         val approx = newton x0
-        fun down x = if compare (pow (x, kB)) n = Greater then down (sub (x, oneB)) else x
+        fun down x = if compare (pow (x, kB), n) = Greater then down (sub (x, oneB)) else x
         val x1 = down approx
-        fun up x = if compare (pow (add (x, oneB), kB)) n <> Greater then up (add (x, oneB)) else x
+        fun up x = if compare (pow (add (x, oneB), kB), n) <> Greater then up (add (x, oneB)) else x
       in up x1 end
 
   (* ----- byte serialization (big-endian, unsigned magnitude) ----- *)
 
   fun toBytesB n =
     let
-      val BI (_, m) = absB n
+      val BI _ m = absB n
       val nbits = bitLength m
     in
       if nbits = 0 then ""
