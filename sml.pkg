@@ -1,0 +1,10 @@
+package github.com/sjqtentacles/sml-tls
+
+require {
+  github.com/sjqtentacles/sml-aead
+  github.com/sjqtentacles/sml-x25519
+  github.com/sjqtentacles/sml-kdf
+  github.com/sjqtentacles/sml-x509
+  github.com/sjqtentacles/sml-codec
+  github.com/sjqtentacles/sml-rsa
+}
