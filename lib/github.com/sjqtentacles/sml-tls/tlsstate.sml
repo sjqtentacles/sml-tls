@@ -70,6 +70,11 @@ struct
   fun mkProtect (cs, (key, iv)) =
     TlsRecordProtect.initWithAlg {key = key, iv = iv, alg = suiteAlg cs}
 
+  (* RFC 8446 §5.2: a received TLSCiphertext.length MUST NOT exceed
+     2^14 + 256; otherwise the receiver MUST send record_overflow. This is
+     a cheap pre-decrypt DoS bound. *)
+  val maxCiphertextLen = 16384 + 256
+
   fun alertByte d = TlsAlert.alertDescriptionToByte d
 
   (* Local fatal-alert signal, caught in `step` and mapped to a terminal
@@ -125,25 +130,26 @@ struct
       {extType = TlsHandshake.extSignatureAlgorithms, data = data}
     end
 
-  (* Build a combined key_share extension offering X25519 and, when a
-     P-256 private key is configured, secp256r1 too (A4). Uses
-     TlsExtensions.encodeKeyShareCH so the CH list framing is shared. *)
+  (* Build the ClientHello key_share extension. We offer a single X25519
+     key_share by default (the preferred group); when a P-256 key is also
+     configured we still advertise secp256r1 in supported_groups but do NOT
+     send a P-256 share up front. This is spec-legal (RFC 8446 §4.2.8: a
+     client need not send a share for every advertised group) and lets the
+     server force a P-256 retry via HelloRetryRequest. *)
+  fun keyShareEntriesFor (group, cfg : clientConfig) : TlsExtensions.keyShareEntry =
+    if group = TlsHandshake.groupX25519 then
+      {group = TlsHandshake.groupX25519,
+       keyExchange = X25519.base (#x25519PrivateKey cfg)}
+    else (* secp256r1 *)
+      (case #p256PrivateKey cfg of
+           SOME pk => {group = TlsHandshake.groupSecp256r1,
+                       keyExchange = P256.generatePublic pk}
+         | NONE => raise Tls "keyShareEntriesFor: no P-256 key")
+
   fun keyShareExtensionMulti (cfg : clientConfig) : TlsHandshake.extension =
-    let
-      val x25519Entry =
-        {group = TlsHandshake.groupX25519,
-         keyExchange = X25519.base (#x25519PrivateKey cfg)}
-      val entries =
-        case #p256PrivateKey cfg of
-            SOME pk =>
-              [x25519Entry,
-               {group = TlsHandshake.groupSecp256r1,
-                keyExchange = P256.generatePublic pk}]
-          | NONE => [x25519Entry]
-    in
-      {extType = TlsHandshake.extKeyShare,
-       data = TlsExtensions.encodeKeyShareCH entries}
-    end
+    {extType = TlsHandshake.extKeyShare,
+     data = TlsExtensions.encodeKeyShareCH
+              [keyShareEntriesFor (TlsHandshake.groupX25519, cfg)]}
 
   fun supportedGroupsExtensionMulti (cfg : clientConfig) : TlsHandshake.extension =
     let
@@ -156,28 +162,48 @@ struct
        data = TlsExtensions.encodeSupportedGroups groups}
     end
 
-  fun startHandshake (cfg : clientConfig) : clientState * string =
+  (* Build a ClientHello offering a single `keyShareGroup` key_share, while
+     still advertising every supported group. `cookieOpt` is SOME when this
+     is ClientHello2 in response to a HelloRetryRequest (the cookie is
+     echoed verbatim, §4.2.2). *)
+  fun buildClientHello (cfg : clientConfig, keyShareGroup, cookieOpt)
+      : TlsHandshake.clientHello =
     let
-      val keyShare = keyShareExtensionMulti cfg
+      val keyShare =
+        {extType = TlsHandshake.extKeyShare,
+         data = TlsExtensions.encodeKeyShareCH
+                  [keyShareEntriesFor (keyShareGroup, cfg)]}
       val supVer = supportedVersionsExtension ()
       val supGrp = supportedGroupsExtensionMulti cfg
       val sigAlg = signatureAlgorithmsExtension ()
-      (* Optional SNI from config.serverName. *)
       val sni =
         if #serverName cfg = "" then []
         else [{extType = TlsHandshake.extServerName,
                data = TlsExtensions.encodeServerName (#serverName cfg)}
               : TlsHandshake.extension]
-      val exts = [#extensions cfg, [keyShare, supVer, supGrp, sigAlg], sni]
-      val allExts = List.concat exts
-      val ch = {
+      val cookie =
+        case cookieOpt of
+            SOME c => [{extType = TlsHandshake.extCookie,
+                        data = TlsExtensions.encodeCookie c}
+                       : TlsHandshake.extension]
+          | NONE => []
+      val allExts =
+        List.concat [#extensions cfg, [keyShare, supVer, supGrp, sigAlg],
+                     sni, cookie]
+    in
+      {
         legacyVersion = 0wx0303,
         random = #clientRandom cfg,
         legacySessionId = #legacySessionId cfg,
         cipherSuites = #cipherSuites cfg,
         legacyCompression = [0w0],
         extensions = allExts
-      } : TlsHandshake.clientHello
+      }
+    end
+
+  fun startHandshake (cfg : clientConfig) : clientState * string =
+    let
+      val ch = buildClientHello (cfg, TlsHandshake.groupX25519, NONE)
       val body = TlsHandshake.encodeClientHello ch
       val msg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.ClientHello, body = body}
@@ -226,7 +252,11 @@ struct
   (* Compute the ECDHE shared secret for the negotiated group. *)
   fun computeDhe (st : clientState, group, peerPub) =
     if group = TlsHandshake.groupX25519 then
-      SOME (X25519.dh (#x25519PrivateKey st) peerPub)
+      (* X25519 public keys are always exactly 32 bytes (RFC 7748); reject
+         any other length rather than crashing X25519.dh. *)
+      (if String.size peerPub = 32
+       then SOME (X25519.dh (#x25519PrivateKey st) peerPub)
+       else NONE)
     else if group = TlsHandshake.groupSecp256r1 then
       (case #p256PrivateKey (#config st) of
            SOME pk => P256.ecdh {privateKey = pk, peerPublic = peerPub}
@@ -242,6 +272,15 @@ struct
         NONE => raise Fatal TlsAlert.DecodeError
       | SOME sh =>
           let
+            (* Illegal legacy fields (RFC 8446 §4.1.3): legacy_version MUST
+               be 0x0303 and legacy_compression_method MUST be 0; a client
+               receiving anything else MUST abort with illegal_parameter. *)
+            val () =
+              if #legacyVersion sh = 0wx0303 then ()
+              else raise Fatal TlsAlert.IllegalParameter
+            val () =
+              if #legacyCompression sh = 0w0 then ()
+              else raise Fatal TlsAlert.IllegalParameter
             val cs = #cipherSuite sh
             (* Enforce: cipher suite must be one the client offered. *)
             val () =
@@ -329,6 +368,102 @@ struct
               connected = false }
           end
 
+  (* Process an incoming HelloRetryRequest (RFC 8446 §4.1.4): validate the
+     server's `selected_group`, apply the synthetic-message transcript
+     substitution (§4.4.1: ClientHello1 is replaced by
+       message_hash || 00 00 Hash.length || Hash(ClientHello1)),
+     then resend ClientHello2 with the requested key_share and the echoed
+     cookie. Returns the new state and the CH2 record to send. *)
+  fun processHelloRetryRequest (st : clientState, shBody : string)
+      : clientState * string list =
+    case TlsHandshake.decodeServerHello shBody of
+        NONE => raise Fatal TlsAlert.DecodeError
+      | SOME sh =>
+          let
+            (* A second HelloRetryRequest is illegal (§4.1.4). After the
+               first HRR the transcript begins with the synthetic
+               message_hash message (handshake type 254). *)
+            val () =
+              if String.size (#transcript st) > 0 andalso
+                 String.sub (#transcript st, 0) = Char.chr 254
+              then raise Fatal TlsAlert.UnexpectedMessage else ()
+            (* selected_version must be TLS 1.3. *)
+            val () =
+              case findExt (#extensions sh, TlsHandshake.extSupportedVersions) of
+                  SOME data =>
+                    (case TlsExtensions.decodeSelectedVersionSH data of
+                         SOME v => if v = 0wx0304 then ()
+                                   else raise Fatal TlsAlert.ProtocolVersion
+                       | NONE => raise Fatal TlsAlert.DecodeError)
+                | NONE => raise Fatal TlsAlert.MissingExtension
+            (* The HRR key_share carries only the server's selected_group. *)
+            val group =
+              case findExt (#extensions sh, TlsHandshake.extKeyShare) of
+                  NONE => raise Fatal TlsAlert.MissingExtension
+                | SOME data =>
+                    (case TlsExtensions.decodeKeyShareHRR data of
+                         SOME g => g
+                       | NONE => raise Fatal TlsAlert.DecodeError)
+            (* The selected group must be one the client advertised but did
+               NOT already send a key_share for. The client only ever sends
+               an X25519 share up front, so a HRR selecting X25519 (which we
+               already offered) is illegal (§4.1.4). A secp256r1 retry is
+               valid only when a P-256 key is configured. *)
+            val () =
+              if group = TlsHandshake.groupSecp256r1 andalso
+                 Option.isSome (#p256PrivateKey (#config st))
+              then ()
+              else raise Fatal TlsAlert.IllegalParameter
+            (* Echo the cookie verbatim if the server sent one. *)
+            val cookieOpt =
+              case findExt (#extensions sh, TlsHandshake.extCookie) of
+                  NONE => NONE
+                | SOME data =>
+                    (case TlsExtensions.decodeCookie data of
+                         SOME c => SOME c
+                       | NONE => raise Fatal TlsAlert.DecodeError)
+            (* Synthetic-message transcript substitution (§4.4.1). *)
+            val ch1Msg = #transcript st
+            val synthetic = TlsHandshake.encodeMessage
+              {msgType = TlsHandshake.MessageHash,
+               body = Sha256.digest ch1Msg}
+            val hrrMsg = TlsHandshake.encodeMessage
+              {msgType = TlsHandshake.ServerHello, body = shBody}
+            val ch2 = buildClientHello (#config st, group, cookieOpt)
+            val ch2Body = TlsHandshake.encodeClientHello ch2
+            val ch2Msg = TlsHandshake.encodeMessage
+              {msgType = TlsHandshake.ClientHello, body = ch2Body}
+            val newTranscript = synthetic ^ hrrMsg ^ ch2Msg
+            val record = TlsRecord.encodePlaintext
+              {contentType = TlsRecord.Handshake, fragment = ch2Msg}
+            val st' = {
+              config = #config st,
+              x25519PrivateKey = #x25519PrivateKey st,
+              clientHello = ch2,
+              transcript = newTranscript,
+              cipherSuite = NONE,
+              dhe = "",
+              negotiatedGroup = SOME group,
+              serverHello = NONE,
+              clientHsSecret = NONE,
+              serverHsSecret = NONE,
+              clientApSecret = NONE,
+              serverApSecret = NONE,
+              serverHandshakeKey = NONE,
+              clientHandshakeKey = NONE,
+              serverAppKey = NONE,
+              clientAppKey = NONE,
+              serverHsProtect = NONE,
+              serverApProtect = NONE,
+              clientApProtect = NONE,
+              certVerified = false,
+              errorAlert = NONE,
+              connected = false
+            } : clientState
+          in
+            (st', [record])
+          end
+
   (* A fatal plaintext Alert record (used before traffic keys exist, and as
      a best-effort terminal signal). *)
   fun alertRecord desc =
@@ -370,6 +505,8 @@ struct
         | SOME (crec, rest) =>
             if #contentType crec = TlsRecord.ChangeCipherSpec then
               decryptFlight (rest, prot, acc)
+            else if String.size (#encryptedRecord crec) > maxCiphertextLen then
+              raise Fatal TlsAlert.RecordOverflow
             else
               (case TlsRecordProtect.unprotect
                       {state = prot, record = #encryptedRecord crec} of
@@ -615,6 +752,8 @@ struct
             | SOME (crec, rest) =>
                 if #contentType crec = TlsRecord.ChangeCipherSpec then
                   loop (rest, st0, outs)
+                else if String.size (#encryptedRecord crec) > maxCiphertextLen then
+                  raise Fatal TlsAlert.RecordOverflow
                 else
                   let val prot = Option.valOf (#serverApProtect st0) in
                     case TlsRecordProtect.unprotect
@@ -641,18 +780,34 @@ struct
       (case #serverHello st of
            NONE =>
              (* Expect a plaintext ServerHello record (or a bare ServerHello
-                handshake message). *)
+                handshake message). `rest` holds any records the peer
+                coalesced after the ServerHello (commonly a middlebox-compat
+                ChangeCipherSpec plus the encrypted flight); we drain it in
+                the same call so a single buffer drives the client through. *)
              let
-               val body =
+               val (body, rest) =
                  case TlsRecord.decodePlaintext input of
-                     SOME (r, _) =>
-                       if #contentType r = TlsRecord.Handshake then #fragment r
-                       else input
-                   | NONE => input
+                     SOME (r, rest) =>
+                       if #contentType r = TlsRecord.Handshake
+                       then (#fragment r, rest)
+                       else (input, "")
+                   | NONE => (input, "")
              in
                case TlsHandshake.decodeMessage body of
                    SOME ({msgType = TlsHandshake.ServerHello, body = shBody}, _) =>
-                     (processServerHello (st, shBody), [])
+                     (case TlsHandshake.decodeServerHello shBody of
+                          NONE => raise Fatal TlsAlert.DecodeError
+                        | SOME sh =>
+                            if #random sh = TlsHandshake.helloRetryRequestRandom
+                            then processHelloRetryRequest (st, shBody)
+                            else
+                              let val st' = processServerHello (st, shBody)
+                              in
+                                (* If the peer coalesced the encrypted flight
+                                   into this buffer, keep processing it. *)
+                                if rest = "" then (st', [])
+                                else step (st', rest)
+                              end)
                  | _ => raise Fatal TlsAlert.UnexpectedMessage
              end
          | SOME _ =>
@@ -666,6 +821,11 @@ struct
              else
                stepConnected (st, input))
       handle Fatal desc => (setError (st, desc), [alertRecord desc])
+           (* Backstop: no malformed peer input may escape `step` as an
+              uncaught exception. Anything unforeseen maps to a fatal
+              decode_error and a terminal error state (never a crash). *)
+           | _ => (setError (st, TlsAlert.DecodeError),
+                   [alertRecord TlsAlert.DecodeError])
 
   (* Send application data under the client application-traffic key,
      threading the AEAD sequence counter through `clientApProtect`. *)
@@ -805,6 +965,9 @@ struct
   fun mkProtect (cs, (key, iv)) =
     TlsRecordProtect.initWithAlg {key = key, iv = iv, alg = suiteAlg cs}
 
+  (* RFC 8446 §5.2 record_overflow bound (see TlsClient). *)
+  val maxCiphertextLen = 16384 + 256
+
   fun nextAppSecret secret =
     TlsKeySchedule.hkdfExpandLabel
       {secret = secret, label = "traffic upd", context = "",
@@ -849,18 +1012,6 @@ struct
               connected = false }
           end
 
-  (* Build the server's key_share extension from its private key. *)
-  fun serverKeyShareExtension (privKey : string) : TlsHandshake.extension =
-    let
-      val pubKey = X25519.base privKey
-      (* ServerHello key_share: 2-byte group, 2-byte key length, key. *)
-      val data = TlsHandshake.word16ToBytes TlsHandshake.groupX25519
-        ^ TlsHandshake.word16ToBytes (Word16.fromInt (String.size pubKey))
-        ^ pubKey
-    in
-      {extType = TlsHandshake.extKeyShare, data = data}
-    end
-
   fun supportedVersionsServerExt () : TlsHandshake.extension =
     let
       val data = TlsHandshake.word16ToBytes 0wx0304
@@ -868,9 +1019,141 @@ struct
       {extType = TlsHandshake.extSupportedVersions, data = data}
     end
 
+  (* The groups this server supports, in preference order. X25519 is always
+     available; secp256r1 only when a P-256 key is configured (A4). *)
+  fun serverGroups (cfg : serverConfig) =
+    case #p256PrivateKey cfg of
+        SOME _ => [TlsHandshake.groupX25519, TlsHandshake.groupSecp256r1]
+      | NONE => [TlsHandshake.groupX25519]
+
+  (* Parse the client's key_share list from a ClientHello. *)
+  fun clientKeyShares (ch : TlsHandshake.clientHello)
+      : TlsExtensions.keyShareEntry list =
+    case List.find (fn {extType, ...} => extType = TlsHandshake.extKeyShare)
+                   (#extensions ch) of
+        SOME {data, ...} =>
+          (case TlsExtensions.decodeKeyShareCH data of
+               SOME xs => xs
+             | NONE => [])
+      | NONE => []
+
+  (* Compute (serverPublicKeyShare, dhe) for the negotiated group. *)
+  fun serverShareAndDhe (cfg : serverConfig, group, peerPub) =
+    if group = TlsHandshake.groupX25519 then
+      (X25519.base (#x25519PrivateKey cfg), X25519.dh (#x25519PrivateKey cfg) peerPub)
+    else (* secp256r1 *)
+      (case #p256PrivateKey cfg of
+           NONE => raise Tls "no P-256 key for negotiated group"
+         | SOME pk =>
+             (P256.generatePublic pk,
+              case P256.ecdh {privateKey = pk, peerPublic = peerPub} of
+                  SOME d => d
+                | NONE => raise Tls "P-256 ECDH failed"))
+
+  (* Build the server's ServerHello key_share extension for the chosen
+     group + public key. *)
+  fun serverKeyShareExt (group, pub) : TlsHandshake.extension =
+    {extType = TlsHandshake.extKeyShare,
+     data = TlsExtensions.encodeKeyShareSH {group = group, keyExchange = pub}}
+
+  (* Emit a HelloRetryRequest (RFC 8446 §4.1.4) forcing the client to retry
+     with a key_share for `group`, optionally carrying a `cookie`. Applies
+     the §4.4.1 synthetic-message transcript substitution: ClientHello1 is
+     replaced by message_hash || 00 00 Hash.length || Hash(ClientHello1). *)
+  fun produceHelloRetryRequest (st : serverState, cfg : serverConfig,
+                                {group, cookie} : {group : Word16.word,
+                                                   cookie : string})
+      : serverState * string =
+    let
+      val supVer = supportedVersionsServerExt ()
+      val keyShare = {extType = TlsHandshake.extKeyShare,
+                      data = TlsExtensions.encodeKeyShareHRR group}
+      val cookieExt =
+        if cookie = "" then []
+        else [{extType = TlsHandshake.extCookie,
+               data = TlsExtensions.encodeCookie cookie} : TlsHandshake.extension]
+      val sessionId =
+        case #clientHello st of SOME ch => #legacySessionId ch | NONE => #legacySessionId cfg
+      val hrr = {
+        legacyVersion = 0wx0303,
+        random = TlsHandshake.helloRetryRequestRandom,
+        legacySessionId = sessionId,
+        cipherSuite = #cipherSuite cfg,
+        legacyCompression = 0w0,
+        extensions = List.concat [[keyShare, supVer], cookieExt]
+      } : TlsHandshake.serverHello
+      val hrrBody = TlsHandshake.encodeServerHello hrr
+      val hrrMsg = TlsHandshake.encodeMessage
+        {msgType = TlsHandshake.ServerHello, body = hrrBody}
+      (* Synthetic-message substitution: the transcript so far is exactly
+         ClientHello1's wire message. *)
+      val ch1Msg = #transcript st
+      val synthetic = TlsHandshake.encodeMessage
+        {msgType = TlsHandshake.MessageHash, body = Sha256.digest ch1Msg}
+      val record = TlsRecord.encodePlaintext
+        {contentType = TlsRecord.Handshake, fragment = hrrMsg}
+      val st' = { x25519PrivateKey = #x25519PrivateKey st,
+        serverRandom = #serverRandom st, cipherSuite = #cipherSuite st,
+        legacySessionId = #legacySessionId st, extensions = #extensions st,
+        transcript = synthetic ^ hrrMsg, dhe = #dhe st,
+        clientHello = #clientHello st, serverHello = #serverHello st,
+        clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
+        clientApSecret = #clientApSecret st, serverApSecret = #serverApSecret st,
+        serverHandshakeKey = #serverHandshakeKey st,
+        clientHandshakeKey = #clientHandshakeKey st,
+        serverAppKey = #serverAppKey st, clientAppKey = #clientAppKey st,
+        clientHsProtect = #clientHsProtect st, clientApProtect = #clientApProtect st,
+        serverApProtect = #serverApProtect st, errorAlert = #errorAlert st,
+        connected = #connected st } : serverState
+    in
+      (st', record)
+    end
+
+  (* Process ClientHello2 after a HelloRetryRequest: append it to the
+     (already synthetic-substituted) transcript and adopt it as the active
+     ClientHello. `ch2Body` is the ClientHello body (no handshake header). *)
+  fun receiveSecondClientHello (st : serverState, ch2Body : string)
+      : serverState =
+    case TlsHandshake.decodeClientHello ch2Body of
+        NONE => raise Tls "malformed ClientHello2"
+      | SOME ch2 =>
+          let
+            val ch2Msg = TlsHandshake.encodeMessage
+              {msgType = TlsHandshake.ClientHello, body = ch2Body}
+          in
+            { x25519PrivateKey = #x25519PrivateKey st,
+              serverRandom = #serverRandom st, cipherSuite = #cipherSuite st,
+              legacySessionId = #legacySessionId st, extensions = #extensions st,
+              transcript = #transcript st ^ ch2Msg, dhe = #dhe st,
+              clientHello = SOME ch2, serverHello = #serverHello st,
+              clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
+              clientApSecret = #clientApSecret st, serverApSecret = #serverApSecret st,
+              serverHandshakeKey = #serverHandshakeKey st,
+              clientHandshakeKey = #clientHandshakeKey st,
+              serverAppKey = #serverAppKey st, clientAppKey = #clientAppKey st,
+              clientHsProtect = #clientHsProtect st, clientApProtect = #clientApProtect st,
+              serverApProtect = #serverApProtect st, errorAlert = #errorAlert st,
+              connected = #connected st } : serverState
+          end
+
   fun produceServerHello (st : serverState, cfg : serverConfig) : serverState * string =
     let
-      val keyShare = serverKeyShareExtension (#x25519PrivateKey cfg)
+      (* Negotiate the key-share group from the client's offered shares. *)
+      val ch = case #clientHello st of
+                   NONE => raise Tls "no ClientHello"
+                 | SOME c => c
+      val shares = clientKeyShares ch
+      val group =
+        case TlsExtensions.negotiateGroup
+               {clientShares = shares, serverGroups = serverGroups cfg} of
+            SOME g => g
+          | NONE => raise Tls "no common key_share group"
+      val peerPub =
+        case List.find (fn {group = g, ...} => g = group) shares of
+            SOME {keyExchange, ...} => keyExchange
+          | NONE => raise Tls "negotiated group has no client share"
+      val (serverPub, dhe) = serverShareAndDhe (cfg, group, peerPub)
+      val keyShare = serverKeyShareExt (group, serverPub)
       val supVer = supportedVersionsServerExt ()
       val exts = List.concat [#extensions cfg, [keyShare, supVer]]
       val sh = {
@@ -885,43 +1168,6 @@ struct
       val shMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.ServerHello, body = shBody}
       val transcript = #transcript st ^ shMsg
-      (* Compute shared secret from the client's key_share. *)
-      fun findClientKeyShare [] = NONE
-        | findClientKeyShare ({extType, data} :: rest) =
-            if extType = TlsHandshake.extKeyShare then
-              (* ClientHello key_share: 2-byte total length, then entries. *)
-              if String.size data < 2 then NONE
-              else
-                let
-                  val total = Word16.toInt (TlsHandshake.bytesToWord16
-                    (Byte.charToByte (String.sub (data, 0)),
-                     Byte.charToByte (String.sub (data, 1))))
-                  fun scan (i, limit) =
-                    if i + 4 > limit then NONE
-                    else
-                      let
-                        val grp = TlsHandshake.bytesToWord16
-                          (Byte.charToByte (String.sub (data, i)),
-                           Byte.charToByte (String.sub (data, i + 1)))
-                        val klen = Word16.toInt (TlsHandshake.bytesToWord16
-                          (Byte.charToByte (String.sub (data, i + 2)),
-                           Byte.charToByte (String.sub (data, i + 3))))
-                      in
-                        if grp = TlsHandshake.groupX25519 andalso i + 4 + klen <= limit then
-                          SOME (String.substring (data, i + 4, klen))
-                        else scan (i + 4 + klen, limit)
-                      end
-                in
-                  scan (2, 2 + total)
-                end
-            else findClientKeyShare rest
-      val clientPub = case #clientHello st of
-                          NONE => raise Tls "no ClientHello"
-                        | SOME ch =>
-                            case findClientKeyShare (#extensions ch) of
-                                NONE => raise Tls "client sent no X25519 key_share"
-                              | SOME k => k
-      val dhe = X25519.dh (#x25519PrivateKey cfg) clientPub
       val sched = TlsKeySchedule.schedule {
         dhe = dhe,
         handshakeTranscript = transcript,
@@ -1189,44 +1435,90 @@ struct
       serverApProtect = #serverApProtect st, errorAlert = #errorAlert st,
       connected = true }
 
+  (* True iff the client's ClientHello offered the early_data extension
+     (RFC 8446 §4.2.10). This server never accepts a PSK, so any offered
+     early_data is rejected: the EncryptedExtensions omit early_data and the
+     undecryptable 0-RTT records are skipped (§2.3 / §4.2.10). *)
+  fun clientOfferedEarlyData (st : serverState) =
+    case #clientHello st of
+        SOME ch =>
+          List.exists (fn {extType, ...} => extType = TlsHandshake.extEarlyData)
+                      (#extensions ch)
+      | NONE => false
+
+  (* DoS bound on how many bytes of rejected early data we skip (§4.2.10:
+     a server ignores early data up to max_early_data_size). One record. *)
+  val maxEarlyDataReject = 16384
+
   (* Feed received ciphertext records to the server.  During the handshake
      this is the client Finished (under the client HS key); once connected it
-     is application data / KeyUpdate (under the client app key). *)
+     is application data / KeyUpdate (under the client app key).
+
+     When the client offered (rejected) 0-RTT early_data, the flight before
+     the client Finished may be preceded by application_data records that
+     the server cannot decrypt (they are under the client_early_traffic
+     key). Those are skipped without advancing the handshake read sequence;
+     an EndOfEarlyData handshake message (§4.5) is likewise skipped. *)
   fun step (st : serverState, input : string) : serverState * string list =
     if Option.isSome (#errorAlert st) then (st, [])
     else if input = "" then (st, [])
     else
       (if not (#connected st) then
-         (* Expect the client Finished under the client HS key. *)
-         (case TlsRecord.decodeCiphertext input of
-              NONE => raise Fatal TlsAlert.DecodeError
-            | SOME (crec, _) =>
-                if #contentType crec = TlsRecord.ChangeCipherSpec then (st, [])
-                else
-                  let val prot = Option.valOf (#clientHsProtect st) in
-                    case TlsRecordProtect.unprotect
-                           {state = prot, record = #encryptedRecord crec} of
-                        NONE => raise Fatal TlsAlert.BadRecordMac
-                      | SOME (_, pt, _) =>
-                          (case TlsHandshake.decodeMessage pt of
-                               SOME ({msgType = TlsHandshake.Finished, body}, _) =>
-                                 let
-                                   val cfKey = TlsKeySchedule.finishedKey
-                                     {secret = Option.valOf (#clientHsSecret st)}
-                                   val expected = TlsKeySchedule.finishedVerifyData
-                                     {finishedKey = cfKey, transcript = #transcript st}
-                                 in
-                                   if expected = body then (markConnected st, [])
-                                   else raise Fatal TlsAlert.DecryptError
-                                 end
-                             | _ => raise Fatal TlsAlert.UnexpectedMessage)
-                  end)
+         (* Loop, skipping rejected early data, until the client Finished. *)
+         let
+           fun hsLoop (remaining, prot, skipped) =
+             if remaining = "" then (st, [])  (* no Finished yet; keep waiting *)
+             else
+               case TlsRecord.decodeCiphertext remaining of
+                   NONE => raise Fatal TlsAlert.DecodeError
+                 | SOME (crec, rest) =>
+                     if #contentType crec = TlsRecord.ChangeCipherSpec then
+                       hsLoop (rest, prot, skipped)
+                     else if String.size (#encryptedRecord crec) > maxCiphertextLen then
+                       raise Fatal TlsAlert.RecordOverflow
+                     else
+                       case TlsRecordProtect.unprotect
+                              {state = prot, record = #encryptedRecord crec} of
+                           NONE =>
+                             (* Undecryptable under the HS key: a rejected
+                                0-RTT record (skip) iff early_data was
+                                offered; otherwise a genuine MAC failure. *)
+                             if clientOfferedEarlyData st then
+                               let val skipped' =
+                                     skipped + String.size (#encryptedRecord crec)
+                               in
+                                 if skipped' > maxEarlyDataReject
+                                 then raise Fatal TlsAlert.UnexpectedMessage
+                                 else hsLoop (rest, prot, skipped')
+                               end
+                             else raise Fatal TlsAlert.BadRecordMac
+                         | SOME (TlsRecord.Handshake, pt, prot') =>
+                             (case TlsHandshake.decodeMessage pt of
+                                  SOME ({msgType = TlsHandshake.EndOfEarlyData, ...}, _) =>
+                                    hsLoop (rest, prot', skipped)
+                                | SOME ({msgType = TlsHandshake.Finished, body}, _) =>
+                                    let
+                                      val cfKey = TlsKeySchedule.finishedKey
+                                        {secret = Option.valOf (#clientHsSecret st)}
+                                      val expected = TlsKeySchedule.finishedVerifyData
+                                        {finishedKey = cfKey, transcript = #transcript st}
+                                    in
+                                      if expected = body then (markConnected st, [])
+                                      else raise Fatal TlsAlert.DecryptError
+                                    end
+                                | _ => raise Fatal TlsAlert.UnexpectedMessage)
+                         | SOME (_, _, _) => raise Fatal TlsAlert.UnexpectedMessage
+         in
+           hsLoop (input, Option.valOf (#clientHsProtect st), 0)
+         end
        else
          (* Connected: decrypt application data / KeyUpdate under client app key. *)
          (case TlsRecord.decodeCiphertext input of
               NONE => raise Fatal TlsAlert.DecodeError
             | SOME (crec, _) =>
                 if #contentType crec = TlsRecord.ChangeCipherSpec then (st, [])
+                else if String.size (#encryptedRecord crec) > maxCiphertextLen then
+                  raise Fatal TlsAlert.RecordOverflow
                 else
                   let val prot = Option.valOf (#clientApProtect st) in
                     case TlsRecordProtect.unprotect
@@ -1244,6 +1536,9 @@ struct
                           end
                   end))
       handle Fatal desc => (setError (st, desc), [alertRecord desc])
+           (* Backstop: never let malformed peer input crash `step`. *)
+           | _ => (setError (st, TlsAlert.DecodeError),
+                   [alertRecord TlsAlert.DecodeError])
 
   fun error (st : serverState) : Word8.word option = #errorAlert st
 

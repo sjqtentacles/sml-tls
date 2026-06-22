@@ -165,6 +165,15 @@ sig
   val extSignatureAlgorithms : Word16.word  (* 13 *)
   val extSupportedVersions   : Word16.word  (* 43 *)
   val extKeyShare            : Word16.word  (* 51 *)
+  val extPreSharedKey        : Word16.word  (* 41 *)
+  val extEarlyData           : Word16.word  (* 42 *)
+  val extCookie              : Word16.word  (* 44 *)
+  val extPskKeyExchangeModes : Word16.word  (* 45 *)
+
+  (* RFC 8446 §4.1.3: the special ServerHello.random value that marks a
+     message as a HelloRetryRequest -- SHA-256 of the ASCII string
+     "HelloRetryRequest". *)
+  val helloRetryRequestRandom : string
 
   (* ---- ClientHello (§4.1.2) ----
      The fields kept are the subset needed for a deterministic 1-RTT
@@ -394,6 +403,26 @@ sig
      using HMAC-SHA-256. `transcript` is the concatenated wire-form handshake
      messages up to and including the message just before this Finished. *)
   val finishedVerifyData : {finishedKey : string, transcript : string} -> string
+
+  (* ---- PSK resumption (RFC 8446 §4.6.1, §7.1, §4.2.11) ----
+
+     resumption_master_secret = Derive-Secret(master_secret, "res master",
+                                  ClientHello...client Finished)
+     The per-ticket PSK is then
+       PSK = HKDF-Expand-Label(resumption_master_secret, "resumption",
+                               ticket_nonce, Hash.length). *)
+  val resumptionMasterSecret : {masterSecret : string, transcript : string} -> string
+  val resumptionPsk : {resumptionMasterSecret : string, ticketNonce : string} -> string
+
+  (* The PskBinderEntry finished key (§4.2.11 / §7.1):
+       binder_key = Derive-Secret(Early-Secret(PSK), "res binder", "")
+       binderFinishedKey = HKDF-Expand-Label(binder_key, "finished", "", Hash.length)
+     and the binder MAC itself
+       pskBinder = HMAC(binderFinishedKey, Transcript-Hash(Truncate(ClientHello)))
+     where `transcript` is the partial ClientHello bytes up to (excluding)
+     the binders list. *)
+  val binderFinishedKey : {psk : string} -> string
+  val pskBinder : {psk : string, transcript : string} -> string
 end
 
 signature TLS_CLIENT =
@@ -515,6 +544,20 @@ sig
      *body* (already extracted from its handshake header by the caller).
      Returns the new state (ClientHelloReceived) with nothing to send yet. *)
   val receiveClientHello : string -> serverState
+
+  (* Emit a HelloRetryRequest (RFC 8446 §4.1.4) that forces the client to
+     retry with a key_share for `group`, optionally carrying a `cookie`.
+     Applies the §4.4.1 synthetic-message transcript substitution
+     (ClientHello1 -> message_hash || 00 00 Hash.length || Hash(CH1)).
+     Returns the new state (transcript reset) and the HRR plaintext record. *)
+  val produceHelloRetryRequest :
+    serverState * serverConfig * {group : Word16.word, cookie : string}
+    -> serverState * string
+
+  (* Process ClientHello2 (its body, no handshake header) received after a
+     HelloRetryRequest: append it to the synthetic-substituted transcript
+     and adopt it as the active ClientHello. *)
+  val receiveSecondClientHello : serverState * string -> serverState
 
   (* Emit the ServerHello (a single plaintext Handshake record) and derive
      the handshake-traffic keys. *)

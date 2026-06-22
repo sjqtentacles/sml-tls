@@ -105,7 +105,17 @@ struct
             else loop (start, start + listLen, [])
     end
 
-  (* SH/HRR form: a single entry {group:16, klen:16, key}, no list prefix. *)
+  (* HRR form: just the 2-byte selected_group (§4.1.4 / §4.2.8). *)
+  fun encodeKeyShareHRR (group : Word16.word) : string =
+    word16ToBytes group
+
+  fun decodeKeyShareHRR (s : string) : Word16.word option =
+    if String.size s <> 2 then NONE
+    else case (byteAt (s, 0), byteAt (s, 1)) of
+             (SOME hi, SOME lo) => SOME (bytesToWord16 (hi, lo))
+           | _ => NONE
+
+  (* SH form: a single entry {group:16, klen:16, key}, no list prefix. *)
   fun encodeKeyShareSH (e : keyShareEntry) : string =
     word16ToBytes (#group e)
     ^ word16ToBytes (Word16.fromInt (String.size (#keyExchange e)))
@@ -292,6 +302,177 @@ struct
                         end
             in
               loop (start, start + listLen, [])
+            end
+
+  (* =================================================================== *)
+  (* cookie (§4.2.2)                                                      *)
+  (* =================================================================== *)
+
+  fun encodeCookie (cookie : string) : string =
+    word16ToBytes (Word16.fromInt (String.size cookie)) ^ cookie
+
+  fun decodeCookie (s : string) : string option =
+    case readU16 (s, 0) of
+        NONE => NONE
+      | SOME (n, start) =>
+          if n = 0 then NONE  (* cookie<1..2^16-1>: non-empty *)
+          else if start + n <> String.size s then NONE
+          else substringOpt (s, start, n)
+
+  (* =================================================================== *)
+  (* psk_key_exchange_modes (§4.2.9)                                      *)
+  (* =================================================================== *)
+
+  val pskModeKe    : Word8.word = 0w0
+  val pskModeDheKe : Word8.word = 0w1
+
+  fun encodePskKeyExchangeModes (modes : Word8.word list) : string =
+    let val body = String.implode (List.map Byte.byteToChar modes) in
+      String.str (Char.chr (String.size body)) ^ body
+    end
+
+  fun decodePskKeyExchangeModes (s : string) : Word8.word list option =
+    case byteAt (s, 0) of
+        NONE => NONE
+      | SOME lenB =>
+          let val n = Word8.toInt lenB in
+            if n = 0 then NONE
+            else if 1 + n <> String.size s then NONE
+            else
+              let
+                fun loop (i, acc) =
+                  if i = 1 + n then SOME (List.rev acc)
+                  else case byteAt (s, i) of
+                           NONE => NONE
+                         | SOME b => loop (i + 1, b :: acc)
+              in loop (1, []) end
+          end
+
+  (* =================================================================== *)
+  (* early_data (§4.2.10)                                                 *)
+  (* =================================================================== *)
+
+  fun word32ToBytes (w : Word32.word) : string =
+    String.implode [
+      Byte.byteToChar (Word8.fromLarge (Word32.toLarge (Word32.>> (w, 0w24)))),
+      Byte.byteToChar (Word8.fromLarge (Word32.toLarge (Word32.>> (w, 0w16)))),
+      Byte.byteToChar (Word8.fromLarge (Word32.toLarge (Word32.>> (w, 0w8)))),
+      Byte.byteToChar (Word8.fromLarge (Word32.toLarge (Word32.andb (w, 0wxFF))))
+    ]
+
+  fun bytesToWord32 (a, b, c, d) =
+    Word32.orb (Word32.<< (Word32.fromLarge (Word8.toLarge a), 0w24),
+    Word32.orb (Word32.<< (Word32.fromLarge (Word8.toLarge b), 0w16),
+    Word32.orb (Word32.<< (Word32.fromLarge (Word8.toLarge c), 0w8),
+                Word32.fromLarge (Word8.toLarge d))))
+
+  val encodeEarlyDataEmpty : string = ""
+
+  fun encodeEarlyDataMaxSize (w : Word32.word) : string = word32ToBytes w
+
+  fun decodeEarlyDataMaxSize (s : string) : Word32.word option =
+    if String.size s <> 4 then NONE
+    else case (byteAt (s, 0), byteAt (s, 1), byteAt (s, 2), byteAt (s, 3)) of
+             (SOME a, SOME b, SOME c, SOME d) =>
+               SOME (bytesToWord32 (a, b, c, d))
+           | _ => NONE
+
+  (* =================================================================== *)
+  (* pre_shared_key (§4.2.11)                                             *)
+  (* =================================================================== *)
+
+  type pskIdentity = {identity : string, obfuscatedTicketAge : Word32.word}
+
+  (* identities: 2-byte total length, then entries
+       {opaque identity<1..2^16-1> (2-byte len + bytes), uint32 age}. *)
+  fun encodeOfferedPsksIdentities (ids : pskIdentity list) : string =
+    let
+      fun one {identity, obfuscatedTicketAge} =
+        word16ToBytes (Word16.fromInt (String.size identity)) ^ identity
+        ^ word32ToBytes obfuscatedTicketAge
+      val body = String.concat (List.map one ids)
+    in
+      word16ToBytes (Word16.fromInt (String.size body)) ^ body
+    end
+
+  (* The on-the-wire length of the binder list body (each binder is a
+     1-byte length prefix + the binder bytes). *)
+  fun binderListLength (binders : string list) : int =
+    List.foldl (fn (b, n) => n + 1 + String.size b) 0 binders
+
+  (* The binder list: 2-byte total length, then 1-byte-prefixed entries. *)
+  fun encodeBinderList (binders : string list) : string =
+    let
+      val body = String.concat
+        (List.map (fn b => String.str (Char.chr (String.size b)) ^ b) binders)
+    in
+      word16ToBytes (Word16.fromInt (String.size body)) ^ body
+    end
+
+  fun encodeSelectedIdentity (idx : Word16.word) : string =
+    word16ToBytes idx
+
+  fun decodeSelectedIdentity (s : string) : Word16.word option =
+    if String.size s <> 2 then NONE
+    else case (byteAt (s, 0), byteAt (s, 1)) of
+             (SOME hi, SOME lo) => SOME (bytesToWord16 (hi, lo))
+           | _ => NONE
+
+  fun decodeOfferedPsks (s : string)
+      : (pskIdentity list * string list) option =
+    case readU16 (s, 0) of
+        NONE => NONE
+      | SOME (idsLen, idsStart) =>
+          if idsStart + idsLen > String.size s then NONE
+          else
+            let
+              val idsEnd = idsStart + idsLen
+              fun readIds (i, acc) =
+                if i = idsEnd then SOME (List.rev acc)
+                else case readU16 (s, i) of
+                         NONE => NONE
+                       | SOME (ilen, istart) =>
+                           if ilen = 0 orelse istart + ilen + 4 > idsEnd then NONE
+                           else
+                             (case (substringOpt (s, istart, ilen),
+                                    byteAt (s, istart + ilen),
+                                    byteAt (s, istart + ilen + 1),
+                                    byteAt (s, istart + ilen + 2),
+                                    byteAt (s, istart + ilen + 3)) of
+                                  (SOME idy, SOME a, SOME b, SOME c, SOME d) =>
+                                    readIds (istart + ilen + 4,
+                                      {identity = idy,
+                                       obfuscatedTicketAge =
+                                         bytesToWord32 (a, b, c, d)} :: acc)
+                                | _ => NONE)
+            in
+              case readIds (idsStart, []) of
+                  NONE => NONE
+                | SOME ids =>
+                    (case readU16 (s, idsEnd) of
+                         NONE => NONE
+                       | SOME (bLen, bStart) =>
+                           if bStart + bLen <> String.size s then NONE
+                           else
+                             let
+                               val bEnd = bStart + bLen
+                               fun readBinders (i, acc) =
+                                 if i = bEnd then SOME (List.rev acc)
+                                 else case byteAt (s, i) of
+                                          NONE => NONE
+                                        | SOME lenB =>
+                                            let val bl = Word8.toInt lenB in
+                                              if bl = 0 orelse i + 1 + bl > bEnd then NONE
+                                              else case substringOpt (s, i + 1, bl) of
+                                                       NONE => NONE
+                                                     | SOME bd =>
+                                                         readBinders (i + 1 + bl, bd :: acc)
+                                            end
+                             in
+                               case readBinders (bStart, []) of
+                                   NONE => NONE
+                                 | SOME binders => SOME (ids, binders)
+                             end)
             end
 
   (* =================================================================== *)

@@ -124,60 +124,64 @@ struct
     | NoApplicationProtocol
     | Other of Word8.word
 
+  (* RFC 8446 §6.2 alert description codes (decimal). NOTE: write every
+     value in decimal -- mixing `0wNN` (decimal) and `0wxNN` (hex) literals
+     here previously mis-encoded a dozen alerts (e.g. protocol_version as
+     46 instead of 70, colliding with certificate_unknown). *)
   fun alertDescriptionToByte CloseNotify             = 0w0
     | alertDescriptionToByte UnexpectedMessage       = 0w10
     | alertDescriptionToByte BadRecordMac           = 0w20
     | alertDescriptionToByte RecordOverflow         = 0w22
-    | alertDescriptionToByte HandshakeFailure       = 0wx28
-    | alertDescriptionToByte BadCertificate         = 0wx2A
-    | alertDescriptionToByte UnsupportedCertificate = 0wx2B
-    | alertDescriptionToByte CertificateRevoked     = 0wx2C
-    | alertDescriptionToByte CertificateExpired     = 0wx2D
-    | alertDescriptionToByte CertificateUnknown     = 0wx2E
-    | alertDescriptionToByte IllegalParameter       = 0wx2F
-    | alertDescriptionToByte UnknownCa              = 0w30
-    | alertDescriptionToByte AccessDenied           = 0w31
-    | alertDescriptionToByte DecodeError            = 0w32
-    | alertDescriptionToByte DecryptError           = 0w33
-    | alertDescriptionToByte ProtocolVersion        = 0w46
-    | alertDescriptionToByte InsufficientSecurity   = 0w47
-    | alertDescriptionToByte InternalError          = 0w50
-    | alertDescriptionToByte UserCancelled          = 0wx5A
-    | alertDescriptionToByte MissingExtension       = 0wx6D
-    | alertDescriptionToByte UnsupportedExtension   = 0wx6E
-    | alertDescriptionToByte UnrecognizedName       = 0w70
-    | alertDescriptionToByte BadCertificateStatus   = 0w71
-    | alertDescriptionToByte UnknownPskIdentity     = 0w73
-    | alertDescriptionToByte CertificateRequired    = 0w74
-    | alertDescriptionToByte NoApplicationProtocol  = 0w78
+    | alertDescriptionToByte HandshakeFailure       = 0w40
+    | alertDescriptionToByte BadCertificate         = 0w42
+    | alertDescriptionToByte UnsupportedCertificate = 0w43
+    | alertDescriptionToByte CertificateRevoked     = 0w44
+    | alertDescriptionToByte CertificateExpired     = 0w45
+    | alertDescriptionToByte CertificateUnknown     = 0w46
+    | alertDescriptionToByte IllegalParameter       = 0w47
+    | alertDescriptionToByte UnknownCa              = 0w48
+    | alertDescriptionToByte AccessDenied           = 0w49
+    | alertDescriptionToByte DecodeError            = 0w50
+    | alertDescriptionToByte DecryptError           = 0w51
+    | alertDescriptionToByte ProtocolVersion        = 0w70
+    | alertDescriptionToByte InsufficientSecurity   = 0w71
+    | alertDescriptionToByte InternalError          = 0w80
+    | alertDescriptionToByte UserCancelled          = 0w90
+    | alertDescriptionToByte MissingExtension       = 0w109
+    | alertDescriptionToByte UnsupportedExtension   = 0w110
+    | alertDescriptionToByte UnrecognizedName       = 0w112
+    | alertDescriptionToByte BadCertificateStatus   = 0w113
+    | alertDescriptionToByte UnknownPskIdentity     = 0w115
+    | alertDescriptionToByte CertificateRequired    = 0w116
+    | alertDescriptionToByte NoApplicationProtocol  = 0w120
     | alertDescriptionToByte (Other w)              = w
 
   fun byteToAlertDescription 0w0  = CloseNotify
     | byteToAlertDescription 0w10 = UnexpectedMessage
     | byteToAlertDescription 0w20 = BadRecordMac
     | byteToAlertDescription 0w22 = RecordOverflow
-    | byteToAlertDescription 0wx28 = HandshakeFailure
-    | byteToAlertDescription 0wx2A = BadCertificate
-    | byteToAlertDescription 0wx2B = UnsupportedCertificate
-    | byteToAlertDescription 0wx2C = CertificateRevoked
-    | byteToAlertDescription 0wx2D = CertificateExpired
-    | byteToAlertDescription 0wx2E = CertificateUnknown
-    | byteToAlertDescription 0wx2F = IllegalParameter
-    | byteToAlertDescription 0w30 = UnknownCa
-    | byteToAlertDescription 0w31 = AccessDenied
-    | byteToAlertDescription 0w32 = DecodeError
-    | byteToAlertDescription 0w33 = DecryptError
-    | byteToAlertDescription 0w46 = ProtocolVersion
-    | byteToAlertDescription 0w47 = InsufficientSecurity
-    | byteToAlertDescription 0w50 = InternalError
-    | byteToAlertDescription 0wx5A = UserCancelled
-    | byteToAlertDescription 0wx6D = MissingExtension
-    | byteToAlertDescription 0wx6E = UnsupportedExtension
-    | byteToAlertDescription 0w70 = UnrecognizedName
-    | byteToAlertDescription 0w71 = BadCertificateStatus
-    | byteToAlertDescription 0w73 = UnknownPskIdentity
-    | byteToAlertDescription 0w74 = CertificateRequired
-    | byteToAlertDescription 0w78 = NoApplicationProtocol
+    | byteToAlertDescription 0w40 = HandshakeFailure
+    | byteToAlertDescription 0w42 = BadCertificate
+    | byteToAlertDescription 0w43 = UnsupportedCertificate
+    | byteToAlertDescription 0w44 = CertificateRevoked
+    | byteToAlertDescription 0w45 = CertificateExpired
+    | byteToAlertDescription 0w46 = CertificateUnknown
+    | byteToAlertDescription 0w47 = IllegalParameter
+    | byteToAlertDescription 0w48 = UnknownCa
+    | byteToAlertDescription 0w49 = AccessDenied
+    | byteToAlertDescription 0w50 = DecodeError
+    | byteToAlertDescription 0w51 = DecryptError
+    | byteToAlertDescription 0w70 = ProtocolVersion
+    | byteToAlertDescription 0w71 = InsufficientSecurity
+    | byteToAlertDescription 0w80 = InternalError
+    | byteToAlertDescription 0w90 = UserCancelled
+    | byteToAlertDescription 0w109 = MissingExtension
+    | byteToAlertDescription 0w110 = UnsupportedExtension
+    | byteToAlertDescription 0w112 = UnrecognizedName
+    | byteToAlertDescription 0w113 = BadCertificateStatus
+    | byteToAlertDescription 0w115 = UnknownPskIdentity
+    | byteToAlertDescription 0w116 = CertificateRequired
+    | byteToAlertDescription 0w120 = NoApplicationProtocol
     | byteToAlertDescription w    = Other w
 
   type alert = {level : alertLevel, description : alertDescription}
@@ -224,7 +228,7 @@ struct
     | handshakeTypeToByte Certificate          = 0w11
     | handshakeTypeToByte CertificateRequest   = 0w13
     | handshakeTypeToByte CertificateVerify    = 0w15
-    | handshakeTypeToByte Finished             = 0w14
+    | handshakeTypeToByte Finished             = 0w20  (* 0x14 *)
     | handshakeTypeToByte KeyUpdate            = 0w24
     | handshakeTypeToByte MessageHash          = 0w254
 
@@ -236,7 +240,7 @@ struct
     | byteToHandshakeType 0w11  = SOME Certificate
     | byteToHandshakeType 0w13  = SOME CertificateRequest
     | byteToHandshakeType 0w15  = SOME CertificateVerify
-    | byteToHandshakeType 0w14  = SOME Finished
+    | byteToHandshakeType 0w20  = SOME Finished  (* 0x14 *)
     | byteToHandshakeType 0w24  = SOME KeyUpdate
     | byteToHandshakeType 0w254 = SOME MessageHash
     | byteToHandshakeType _     = NONE
@@ -310,7 +314,6 @@ struct
         val total = Word16.toInt (bytesToWord16
           (Byte.charToByte (String.sub (s, 0)), Byte.charToByte (String.sub (s, 1))))
         exception Bad
-        val _ = if String.size s < 2 + total then raise Bad else ()
         fun loop (i, acc) =
           if i >= 2 + total then SOME (List.rev acc)
           else
@@ -329,7 +332,8 @@ struct
                   in loop (i + 4 + dl, {extType = et, data = d} :: acc) end
               end
       in
-        loop (2, []) handle Bad => NONE
+        if String.size s < 2 + total then NONE
+        else (loop (2, []) handle Bad => NONE)
       end
 
   val extServerName          : Word16.word = 0wx0000
@@ -337,6 +341,19 @@ struct
   val extSignatureAlgorithms : Word16.word = 0wx000D
   val extSupportedVersions   : Word16.word = 0wx002B
   val extKeyShare            : Word16.word = 0wx0033
+  val extPreSharedKey        : Word16.word = 0wx0029
+  val extEarlyData           : Word16.word = 0wx002A
+  val extCookie              : Word16.word = 0wx002C
+  val extPskKeyExchangeModes : Word16.word = 0wx002D
+
+  (* SHA-256("HelloRetryRequest") -- RFC 8446 §4.1.3. *)
+  val helloRetryRequestRandom : string =
+    String.implode (List.map Char.chr [
+      0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
+      0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+      0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E,
+      0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C
+    ])
 
   (* ---- ClientHello (§4.1.2) ---- *)
   type clientHello = {
@@ -533,8 +550,10 @@ struct
 
   fun encodeCertificate {certificateRequestContext, certificateList} =
     let
+      (* RFC 8446 sec 4.4.2: certificate_request_context is opaque<0..2^8-1>,
+         i.e. a SINGLE-byte length prefix (not 3 bytes). *)
       val ctxLen = String.size certificateRequestContext
-      val ctx = len3 ctxLen ^ certificateRequestContext
+      val ctx = String.str (Char.chr (ctxLen mod 256)) ^ certificateRequestContext
       fun oneEntry {certData, extensions} =
         len3 (String.size certData) ^ certData ^ encodeExtensions extensions
       val entries = String.concat (List.map oneEntry certificateList)
@@ -547,9 +566,13 @@ struct
     let
       val len = String.size s
     in
-      case readLen3 (s, 0) of
-          NONE => NONE
-        | SOME (ctxLen, i) =>
+      (* RFC 8446 sec 4.4.2: certificate_request_context has a 1-byte length. *)
+      if len < 1 then NONE
+      else
+        let
+          val ctxLen = Word8.toInt (Byte.charToByte (String.sub (s, 0)))
+          val i = 1
+        in
             if i + ctxLen > len then NONE
             else
               let
@@ -596,28 +619,31 @@ struct
                                       certificateList = entries}
                         end
               end
+        end
     end
 
   (* ---- CertificateVerify (§4.4.3) ---- *)
   type certificateVerify = {sigAlg : Word16.word, sigBytes : string}
 
+  (* RFC 8446 sec 4.4.3: signature is opaque<0..2^16-1>, i.e. a 2-byte
+     length prefix (not 3 bytes). *)
   fun encodeCertificateVerify {sigAlg, sigBytes} =
     word16ToBytes sigAlg
-    ^ len3 (String.size sigBytes) ^ sigBytes
+    ^ word16ToBytes (Word16.fromInt (String.size sigBytes)) ^ sigBytes
 
   fun decodeCertificateVerify s =
-    if String.size s < 5 then NONE
+    if String.size s < 4 then NONE
     else
       let
         val sigAlg = bytesToWord16 (Byte.charToByte (String.sub (s, 0)),
                                     Byte.charToByte (String.sub (s, 1)))
+        val n = Word16.toInt (bytesToWord16
+                  (Byte.charToByte (String.sub (s, 2)),
+                   Byte.charToByte (String.sub (s, 3))))
+        val i = 4
       in
-        case readLen3 (s, 2) of
-            NONE => NONE
-          | SOME (n, i) =>
-              if i + n > String.size s then NONE
-              else SOME {sigAlg = sigAlg,
-                         sigBytes = String.substring (s, i, n)}
+        if i + n > String.size s then NONE
+        else SOME {sigAlg = sigAlg, sigBytes = String.substring (s, i, n)}
       end
 
   (* ---- Finished (§4.4.4) ---- *)
@@ -852,6 +878,28 @@ struct
 
   fun finishedVerifyData {finishedKey, transcript} =
     Hmac.hmacSha256 finishedKey (transcriptHash transcript)
+
+  (* ---- PSK resumption (RFC 8446 §4.6.1, §7.1, §4.2.11) ---- *)
+
+  fun resumptionMasterSecret {masterSecret, transcript} =
+    deriveSecret {secret = masterSecret, label = "res master",
+                  transcript = transcript}
+
+  fun resumptionPsk {resumptionMasterSecret, ticketNonce} =
+    hkdfExpandLabel {secret = resumptionMasterSecret, label = "resumption",
+                     context = ticketNonce, length = hashLen}
+
+  (* binder_key = Derive-Secret(Early-Secret(PSK), "res binder", "") *)
+  fun binderKey {psk} =
+    let val es = extract {salt = zeros, ikm = psk}
+    in deriveSecret {secret = es, label = "res binder", transcript = ""} end
+
+  fun binderFinishedKey {psk} =
+    hkdfExpandLabel {secret = binderKey {psk = psk}, label = "finished",
+                     context = "", length = hashLen}
+
+  fun pskBinder {psk, transcript} =
+    Hmac.hmacSha256 (binderFinishedKey {psk = psk}) (transcriptHash transcript)
 
   type keySchedule = {
     earlySecret       : string,

@@ -4,6 +4,8 @@ fun runAllSuites () =
   ; RecordTests.run ()
   ; CertTests.run ()
   ; ExtTests.run ()
+  ; Hs2Tests.run ()
+  ; HardenTests.run ()
   ; Harness.run () )
 
 fun main () =

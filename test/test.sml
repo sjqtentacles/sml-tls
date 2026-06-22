@@ -532,6 +532,26 @@ struct
       val () = checkBool ("server/client agree on client app key")
         (true, TlsServer.clientAppKey sst3 = TlsClient.clientAppKey cst2)
 
+      (* ---- J1/J2: coalesced server flight in a SINGLE step ---- *)
+      (* Real peers (e.g. OpenSSL) deliver ServerHello, a middlebox-compat
+         ChangeCipherSpec, and the whole encrypted flight in one TCP segment.
+         A single `step` over that concatenation must drive the client all
+         the way to Connected -- not silently drop the bytes after the
+         ServerHello record. (Regression: OpenSSL differential found the
+         client hung here because step processed only the ServerHello.) *)
+      val () = section "J2: coalesced ServerHello+CCS+flight in one step"
+      val ccsRecord = String.implode (List.map Char.chr [20, 3, 3, 0, 1, 1])
+      val coalesced = shRecord ^ ccsRecord ^ flight
+      val (cstCo, coOut) = TlsClient.step (cst0, coalesced)
+      val () = checkBool ("coalesced flight: client connected in one step")
+        (true, TlsClient.isConnected cstCo)
+      val () = checkBool ("coalesced flight: no client error")
+        (true, not (Option.isSome (TlsClient.error cstCo)))
+      val () = checkBool ("coalesced flight: client emits one Finished record")
+        (true, List.length coOut = 1)
+      val () = checkBool ("coalesced flight: same client Finished as split path")
+        (true, coOut = clientOut)
+
       (* ---- J1: application data round-trip + sequence numbers ---- *)
       val () = section "J1: application data + incrementing sequence numbers"
       val (cst3, appRec0) = TlsClient.sendApplicationData (cst2, "message one")
