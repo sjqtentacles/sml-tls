@@ -9,13 +9,13 @@ machine. The caller owns the transport: feed bytes received from the peer to
 them on the wire yourself. No sockets, no threads, no global state.
 
 > [!WARNING]
-> **Experimental — not for production security.** This is a reference /
-> educational implementation. It is verified against the RFC 8448 test vectors,
-> but passing key-schedule vectors is not the same as being safe to terminate
-> real TLS traffic. Pure SML arithmetic is **not constant-time** (timing
-> side-channel exposure), the handshake and certificate-chain validation paths
-> are only partially exercised, and it has had no security audit. Do not use it
-> to protect real secrets or in any setting where an adversary is present.
+> **Not for production security.** This is a reference / research implementation.
+> Pure SML arithmetic is **not constant-time** (timing side-channel exposure on
+> every RSA, AES, X25519, and ChaCha20 operation). There is no mechanized proof
+> linking the HOL4 spec to the SML or CakeML code, and the library has had no
+> security audit. Do not use it to protect real secrets or in any setting where a
+> network adversary is present. See [`SECURITY.md`](SECURITY.md) for the full,
+> honest trust boundary.
 
 Part of the `sjqtentacles` monorepo of SML libraries. It builds on the
 vendored crypto family:
@@ -49,13 +49,26 @@ vendored crypto family:
 
 ## Status
 
-The record layer, alert codec, handshake message codecs, and the full
-key schedule are complete and tested against RFC 8448 vectors. The client
-and server state machines implement the 1-RTT handshake skeleton
-(ClientHello/ServerHello production, key-share extraction, traffic-key
-derivation). Record-layer AEAD encryption/decryption is delegated to the
-caller, who uses the traffic keys extracted from the state together with
-the vendored `sml-aead` -- this keeps the core sans-IO.
+**280 tests passing on MLton and Poly/ML.**  Completed and interop-verified:
+
+- Full 1-RTT handshake: ClientHello, ServerHello, EncryptedExtensions,
+  Certificate, CertificateVerify (RSA-PSS, signed and verified), Finished.
+- HelloRetryRequest + cookie with the §4.4.1 synthetic transcript-hash
+  substitution.
+- AEAD record protection (AES-128-GCM / AES-256-GCM / ChaCha20-Poly1305)
+  built into the state machine.
+- X.509 certificate chain validation, hostname matching, validity window.
+- `signature_algorithms` enforcement; 0-RTT/early_data reject; KeyUpdate;
+  NewSessionTicket; full alert state machine.
+- **Interop-verified against OpenSSL 3.6.0** (live TLS 1.3 handshake to
+  CONNECTED, 6 real RFC-compliance bugs found and fixed by the differential).
+- **CakeML port (L0–L4):** the entire stack — crypto tower through the TLS
+  state machine — is ported to and verified on the pinned CakeML v3400
+  compiler.  An in-process client↔server 1-RTT handshake runs natively.
+- **HOL4 formal proofs:** wire round-trips, key-schedule structure, and 8
+  handshake-safety invariants machine-checked with 0 axioms / 0 cheats.
+  See [`proof/PROOF_STATUS.md`](proof/PROOF_STATUS.md) for what is and is not
+  proved.  See [`SECURITY.md`](SECURITY.md) for the complete trust boundary.
 
 ## Portability
 
