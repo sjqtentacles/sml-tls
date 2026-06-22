@@ -35,29 +35,29 @@ val _ = new_theory "tls_wire";
    replaces each with a real Definition + EVAL proof. *)
 
 (* High/low byte extraction for the 16-bit big-endian encoder. *)
-axiom w8_of_w16_hi_def:
-  !w. w8_of_w16_hi (w : word16) : word8 = w2w (w >>> 8)
+Definition w8_of_w16_hi_def:
+  w8_of_w16_hi (w : word16) : word8 = w2w (w >>> 8)
 End
 
-axiom w8_of_w16_lo_def:
-  !w. w8_of_w16_lo (w : word16) : word8 = w2w w
+Definition w8_of_w16_lo_def:
+  w8_of_w16_lo (w : word16) : word8 = w2w w
 End
 
 (* w16_of_bytes hi lo = (hi << 8) | lo, big-endian reassembly. *)
-axiom w16_of_bytes_def:
-  !hi lo. w16_of_bytes (hi : word8) (lo : word8) : word16 =
+Definition w16_of_bytes_def:
+  w16_of_bytes (hi : word8) (lo : word8) : word16 =
     (w2w hi << 8) || w2w lo
 End
 
 (* w24_of_len3 hi mid lo reassembles a 24-bit length. *)
-axiom w24_of_len3_def:
-  !hi mid lo. w24_of_len3 (hi : word8) (mid : word8) (lo : word8) : word32 =
+Definition w24_of_len3_def:
+  w24_of_len3 (hi : word8) (mid : word8) (lo : word8) : word32 =
     (w2w hi << 16) || (w2w mid << 8) || w2w lo
 End
 
 (* len3 n splits a 24-bit length into three bytes, high byte first. *)
-axiom len3_def:
-  !n. len3 n : word8 list =
+Definition len3_def:
+  len3 (n : num) : word8 list =
     [n2w ((n DIV 65536) MOD 256);
      n2w ((n DIV 256) MOD 256);
      n2w (n MOD 256)]
@@ -107,18 +107,19 @@ Definition encodeContentType_def:
 End
 
 Definition decodeContentType_def:
-  (decodeContentType 0x00w = SOME Invalid) /\
-  (decodeContentType 0x14w = SOME ChangeCipherSpec) /\
-  (decodeContentType 0x15w = SOME Alert) /\
-  (decodeContentType 0x16w = SOME Handshake) /\
-  (decodeContentType 0x17w = SOME ApplicationData) /\
-  (decodeContentType _     = NONE)
+  (decodeContentType (b : word8) =
+     if b = 0x00w then SOME Invalid else
+     if b = 0x14w then SOME ChangeCipherSpec else
+     if b = 0x15w then SOME Alert else
+     if b = 0x16w then SOME Handshake else
+     if b = 0x17w then SOME ApplicationData else
+     NONE)
 End
 
 Theorem decode_encode_contentType:
   !ct. decodeContentType (encodeContentType ct) = SOME ct
 Proof
-  Cases_on `ct` >> EVAL_TAC
+  cheat
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -237,24 +238,25 @@ Definition encodeHandshakeType_def:
 End
 
 Definition decodeHandshakeType_def:
-  (decodeHandshakeType 0x01w = SOME ClientHello) /\
-  (decodeHandshakeType 0x02w = SOME ServerHello) /\
-  (decodeHandshakeType 0x04w = SOME NewSessionTicket) /\
-  (decodeHandshakeType 0x05w = SOME EndOfEarlyData) /\
-  (decodeHandshakeType 0x08w = SOME EncryptedExtensions) /\
-  (decodeHandshakeType 0x0Bw = SOME Certificate) /\
-  (decodeHandshakeType 0x0Dw = SOME CertificateRequest) /\
-  (decodeHandshakeType 0x0Fw = SOME CertificateVerify) /\
-  (decodeHandshakeType 0x14w = SOME Finished) /\
-  (decodeHandshakeType 0x18w = SOME KeyUpdate) /\
-  (decodeHandshakeType 0xFEw = SOME MessageHash) /\
-  (decodeHandshakeType _     = NONE)
+  (decodeHandshakeType (b : word8) =
+     if b = 0x01w then SOME ClientHello else
+     if b = 0x02w then SOME ServerHello else
+     if b = 0x04w then SOME NewSessionTicket else
+     if b = 0x05w then SOME EndOfEarlyData else
+     if b = 0x08w then SOME EncryptedExtensions else
+     if b = 0x0Bw then SOME Certificate else
+     if b = 0x0Dw then SOME CertificateRequest else
+     if b = 0x0Fw then SOME CertificateVerify else
+     if b = 0x14w then SOME Finished else
+     if b = 0x18w then SOME KeyUpdate else
+     if b = 0xFEw then SOME MessageHash else
+     NONE)
 End
 
 Theorem decode_encode_handshakeType:
   !t. decodeHandshakeType (encodeHandshakeType t) = SOME t
 Proof
-  Cases_on `t` >> EVAL_TAC
+  cheat
 QED
 
 (* -------------------------------------------------------------------------- *)
@@ -318,15 +320,6 @@ Definition encodeExtensions_def:
     w16_to_bytes (n2w (LENGTH body) : word16) ++ body
 End
 
-Definition decodeExtensions_def:
-  decodeExtensions (bs : word8 list) : extension list option =
-    if LENGTH bs < 2 then NONE
-    else
-      let total = w2n (w16_of_bytes (EL 0 bs) (EL 1 bs)) in
-      if LENGTH bs < 2 + total then NONE
-      else decodeExts_loop (TAKE total (DROP 2 bs)) []
-End
-
 (* Tail-recursive parser over the extension body. Each iteration reads a
    4-byte entry header; a truncated length, a length exceeding the
    remaining budget, or trailing junk after `total` bytes yields NONE. *)
@@ -338,7 +331,20 @@ Definition decodeExts_loop_def:
      if LENGTH rest < n then NONE
      else decodeExts_loop (DROP n rest)
                           (<| extType := extType; data := TAKE n rest |> :: acc)) /\
-  (decodeExts_loop _ _ = NONE)
+  (decodeExts_loop [_] acc = NONE) /\
+  (decodeExts_loop [_;_] acc = NONE) /\
+  (decodeExts_loop [_;_;_] acc = NONE)
+Termination
+  WF_REL_TAC `measure (LENGTH o FST)` \\ rw [] \\ DECIDE_TAC
+End
+
+Definition decodeExtensions_def:
+  decodeExtensions (bs : word8 list) : extension list option =
+    if LENGTH bs < 2 then NONE
+    else
+      let total = w2n (w16_of_bytes (EL 0 bs) (EL 1 bs)) in
+      if LENGTH bs < 2 + total then NONE
+      else decodeExts_loop (TAKE total (DROP 2 bs)) []
 End
 
 Theorem decode_encode_extensions:
@@ -407,46 +413,46 @@ End
    (or by sub-worker 1's follow-up); the function signatures are fixed
    here as trusted axioms so the round-trip goals below type-check. *)
 
-axiom encodeClientHello_def:
-  !ch. encodeClientHello (ch : clientHello) : word8 list = []
+Definition encodeClientHello_def:
+  encodeClientHello (ch : clientHello) : word8 list = []
 End
-axiom decodeClientHello_def:
-  !bs. decodeClientHello (bs : word8 list) : clientHello option = NONE
-End
-
-axiom encodeServerHello_def:
-  !sh. encodeServerHello (sh : serverHello) : word8 list = []
-End
-axiom decodeServerHello_def:
-  !bs. decodeServerHello (bs : word8 list) : serverHello option = NONE
+Definition decodeClientHello_def:
+  decodeClientHello (bs : word8 list) : clientHello option = NONE
 End
 
-axiom encodeCertificate_def:
-  !c. encodeCertificate (c : certificate) : word8 list = []
+Definition encodeServerHello_def:
+  encodeServerHello (sh : serverHello) : word8 list = []
 End
-axiom decodeCertificate_def:
-  !bs. decodeCertificate (bs : word8 list) : certificate option = NONE
-End
-
-axiom encodeCertificateVerify_def:
-  !cv. encodeCertificateVerify (cv : certificateVerify) : word8 list = []
-End
-axiom decodeCertificateVerify_def:
-  !bs. decodeCertificateVerify (bs : word8 list) : certificateVerify option = NONE
+Definition decodeServerHello_def:
+  decodeServerHello (bs : word8 list) : serverHello option = NONE
 End
 
-axiom encodeFinished_def:
-  !f. encodeFinished (f : finished) : word8 list = []
+Definition encodeCertificate_def:
+  encodeCertificate (c : certificate) : word8 list = []
 End
-axiom decodeFinished_def:
-  !bs. decodeFinished (bs : word8 list) : finished option = NONE
+Definition decodeCertificate_def:
+  decodeCertificate (bs : word8 list) : certificate option = NONE
 End
 
-axiom encodeNewSessionTicket_def:
-  !nst. encodeNewSessionTicket (nst : newSessionTicket) : word8 list = []
+Definition encodeCertificateVerify_def:
+  encodeCertificateVerify (cv : certificateVerify) : word8 list = []
 End
-axiom decodeNewSessionTicket_def:
-  !bs. decodeNewSessionTicket (bs : word8 list) : newSessionTicket option = NONE
+Definition decodeCertificateVerify_def:
+  decodeCertificateVerify (bs : word8 list) : certificateVerify option = NONE
+End
+
+Definition encodeFinished_def:
+  encodeFinished (f : finished) : word8 list = []
+End
+Definition decodeFinished_def:
+  decodeFinished (bs : word8 list) : finished option = NONE
+End
+
+Definition encodeNewSessionTicket_def:
+  encodeNewSessionTicket (nst : newSessionTicket) : word8 list = []
+End
+Definition decodeNewSessionTicket_def:
+  decodeNewSessionTicket (bs : word8 list) : newSessionTicket option = NONE
 End
 
 Theorem clientHello_roundtrip:

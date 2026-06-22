@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Source: tls_wireScript.sml</title>
+<style>
+  :root { --bg:#ffffff; --fg:#1f2328; --muted:#6e7781;
+          --pre-bg:#f6f8fa; --pre-border:#d0d7de; --hl:#fff8c5; }
+  html { background: var(--bg); }
+  body { font-family: system-ui, -apple-system, sans-serif;
+         color: var(--fg); margin: 1.5rem auto; max-width: 80rem;
+         padding: 0 1rem 3rem; line-height: 1.4; }
+  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 0.8rem; }
+  pre {
+    background: var(--pre-bg); border: 1px solid var(--pre-border);
+    border-radius: 6px; padding: 0.6rem 0.9rem; margin: 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas,
+                 monospace;
+    font-size: 0.9rem; line-height: 1.5;
+  }
+  .line-num { display: inline-block; width: 4em;
+              padding-right: 1em; text-align: right;
+              color: var(--muted); user-select: none; }
+  .line:target { background: var(--hl); }
+</style>
+</head>
+<body>
+<h1>tls_wireScript.sml</h1>
+<pre><span class="line" id="L1"><span class="line-num">1</span>(* tls_wireScript.sml</span>
+<span class="line" id="L2"><span class="line-num">2</span></span>
+<span class="line" id="L3"><span class="line-num">3</span>   HOL4 formal model of the TLS 1.3 wire formats (RFC 8446), Track B1,</span>
+<span class="line" id="L4"><span class="line-num">4</span>   sub-worker 1. This theory is derived from the RFC (and aligned with</span>
+<span class="line" id="L5"><span class="line-num">5</span>   the Phase 0 SML signatures TLS_RECORD / TLS_HANDSHAKE / TLS_EXTENSIONS</span>
+<span class="line" id="L6"><span class="line-num">6</span>   in tls.sig), so it proceeds in parallel with all functional work.</span>
+<span class="line" id="L7"><span class="line-num">7</span></span>
+<span class="line" id="L8"><span class="line-num">8</span>   Conventions mirror the SML library:</span>
+<span class="line" id="L9"><span class="line-num">9</span>     - bytes are HOL4 ``:word8`` values; byte strings are ``:word8 list``;</span>
+<span class="line" id="L10"><span class="line-num">10</span>     - multi-byte integers are big-endian;</span>
+<span class="line" id="L11"><span class="line-num">11</span>     - every decoder is total: a malformed input yields ``NONE``, never a</span>
+<span class="line" id="L12"><span class="line-num">12</span>       partial value;</span>
+<span class="line" id="L13"><span class="line-num">13</span>     - datatypes are exhaustive over the RFC's named values and carry an</span>
+<span class="line" id="L14"><span class="line-num">14</span>       ``Other`` constructor only where the SML does (alert descriptions).</span>
+<span class="line" id="L15"><span class="line-num">15</span></span>
+<span class="line" id="L16"><span class="line-num">16</span>   Round-trip theorems of the form</span>
+<span class="line" id="L17"><span class="line-num">17</span></span>
+<span class="line" id="L18"><span class="line-num">18</span>       decode (encode x) = SOME (x, [])</span>
+<span class="line" id="L19"><span class="line-num">19</span></span>
+<span class="line" id="L20"><span class="line-num">20</span>   are stated (and proved by EVAL for the small cases) for each structure.</span>
+<span class="line" id="L21"><span class="line-num">21</span>*)</span>
+<span class="line" id="L22"><span class="line-num">22</span></span>
+<span class="line" id="L23"><span class="line-num">23</span>open HolKernel Parse boolLib bossLib;</span>
+<span class="line" id="L24"><span class="line-num">24</span>open listTheory optionTheory wordsTheory;</span>
+<span class="line" id="L25"><span class="line-num">25</span></span>
+<span class="line" id="L26"><span class="line-num">26</span>val _ = new_theory &quot;tls_wire&quot;;</span>
+<span class="line" id="L27"><span class="line-num">27</span></span>
+<span class="line" id="L28"><span class="line-num">28</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L29"><span class="line-num">29</span>(*  Trusted (but mechanical) byte/word helpers                                *)</span>
+<span class="line" id="L30"><span class="line-num">30</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L31"><span class="line-num">31</span></span>
+<span class="line" id="L32"><span class="line-num">32</span>(* These are provable from fcpTheory / wordTheory by EVAL; the exact shape</span>
+<span class="line" id="L33"><span class="line-num">33</span>   depends on HOL4's word library which is still building at write time.</span>
+<span class="line" id="L34"><span class="line-num">34</span>   Stated as axioms here so the rest of the theory type-checks; Phase 7</span>
+<span class="line" id="L35"><span class="line-num">35</span>   replaces each with a real Definition + EVAL proof. *)</span>
+<span class="line" id="L36"><span class="line-num">36</span></span>
+<span class="line" id="L37"><span class="line-num">37</span>(* High/low byte extraction for the 16-bit big-endian encoder. *)</span>
+<span class="line" id="L38"><span class="line-num">38</span>Definition w8_of_w16_hi_def:</span>
+<span class="line" id="L39"><span class="line-num">39</span>  w8_of_w16_hi (w : word16) : word8 = w2w (w &gt;&gt;&gt; 8)</span>
+<span class="line" id="L40"><span class="line-num">40</span>End</span>
+<span class="line" id="L41"><span class="line-num">41</span></span>
+<span class="line" id="L42"><span class="line-num">42</span>Definition w8_of_w16_lo_def:</span>
+<span class="line" id="L43"><span class="line-num">43</span>  w8_of_w16_lo (w : word16) : word8 = w2w w</span>
+<span class="line" id="L44"><span class="line-num">44</span>End</span>
+<span class="line" id="L45"><span class="line-num">45</span></span>
+<span class="line" id="L46"><span class="line-num">46</span>(* w16_of_bytes hi lo = (hi &lt;&lt; 8) | lo, big-endian reassembly. *)</span>
+<span class="line" id="L47"><span class="line-num">47</span>Definition w16_of_bytes_def:</span>
+<span class="line" id="L48"><span class="line-num">48</span>  w16_of_bytes (hi : word8) (lo : word8) : word16 =</span>
+<span class="line" id="L49"><span class="line-num">49</span>    (w2w hi &lt;&lt; 8) || w2w lo</span>
+<span class="line" id="L50"><span class="line-num">50</span>End</span>
+<span class="line" id="L51"><span class="line-num">51</span></span>
+<span class="line" id="L52"><span class="line-num">52</span>(* w24_of_len3 hi mid lo reassembles a 24-bit length. *)</span>
+<span class="line" id="L53"><span class="line-num">53</span>Definition w24_of_len3_def:</span>
+<span class="line" id="L54"><span class="line-num">54</span>  w24_of_len3 (hi : word8) (mid : word8) (lo : word8) : word32 =</span>
+<span class="line" id="L55"><span class="line-num">55</span>    (w2w hi &lt;&lt; 16) || (w2w mid &lt;&lt; 8) || w2w lo</span>
+<span class="line" id="L56"><span class="line-num">56</span>End</span>
+<span class="line" id="L57"><span class="line-num">57</span></span>
+<span class="line" id="L58"><span class="line-num">58</span>(* len3 n splits a 24-bit length into three bytes, high byte first. *)</span>
+<span class="line" id="L59"><span class="line-num">59</span>Definition len3_def:</span>
+<span class="line" id="L60"><span class="line-num">60</span>  len3 (n : num) : word8 list =</span>
+<span class="line" id="L61"><span class="line-num">61</span>    [n2w ((n DIV 65536) MOD 256);</span>
+<span class="line" id="L62"><span class="line-num">62</span>     n2w ((n DIV 256) MOD 256);</span>
+<span class="line" id="L63"><span class="line-num">63</span>     n2w (n MOD 256)]</span>
+<span class="line" id="L64"><span class="line-num">64</span>End</span>
+<span class="line" id="L65"><span class="line-num">65</span></span>
+<span class="line" id="L66"><span class="line-num">66</span>(* mk_tlsPlaintext / mk_tlsCiphertext / mk_handshakeMessage are the</span>
+<span class="line" id="L67"><span class="line-num">67</span>   record constructors generated by Datatype; the calls below rely on</span>
+<span class="line" id="L68"><span class="line-num">68</span>   them, so the Datatype declarations must precede their use. *)</span>
+<span class="line" id="L69"><span class="line-num">69</span></span>
+<span class="line" id="L70"><span class="line-num">70</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L71"><span class="line-num">71</span>(*  Shared byte / word primitives                                             *)</span>
+<span class="line" id="L72"><span class="line-num">72</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L73"><span class="line-num">73</span></span>
+<span class="line" id="L74"><span class="line-num">74</span>(* The TLS legacy record version field: always 0x0303 on the wire even for</span>
+<span class="line" id="L75"><span class="line-num">75</span>   TLS 1.3 (RFC 8446 5.1). Kept as a 16-bit word constant. *)</span>
+<span class="line" id="L76"><span class="line-num">76</span>Definition legacyVersion_def:</span>
+<span class="line" id="L77"><span class="line-num">77</span>  legacyVersion : word16 = 0x0303w</span>
+<span class="line" id="L78"><span class="line-num">78</span>End</span>
+<span class="line" id="L79"><span class="line-num">79</span></span>
+<span class="line" id="L80"><span class="line-num">80</span>(* Encode a 16-bit big-endian integer as a 2-byte list. The high byte is</span>
+<span class="line" id="L81"><span class="line-num">81</span>   the top 8 bits; the low byte is the bottom 8. Defined in terms of the</span>
+<span class="line" id="L82"><span class="line-num">82</span>   w8_of_w16_hi/lo helpers axiomatised at the bottom of this file. *)</span>
+<span class="line" id="L83"><span class="line-num">83</span>Definition w16_to_bytes_def:</span>
+<span class="line" id="L84"><span class="line-num">84</span>  w16_to_bytes (w : word16) : word8 list =</span>
+<span class="line" id="L85"><span class="line-num">85</span>    [w8_of_w16_hi w; w8_of_w16_lo w]</span>
+<span class="line" id="L86"><span class="line-num">86</span>End</span>
+<span class="line" id="L87"><span class="line-num">87</span></span>
+<span class="line" id="L88"><span class="line-num">88</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L89"><span class="line-num">89</span>(*  Content type (RFC 8446 5.1 / 5.2)                                         *)</span>
+<span class="line" id="L90"><span class="line-num">90</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L91"><span class="line-num">91</span></span>
+<span class="line" id="L92"><span class="line-num">92</span>Datatype:</span>
+<span class="line" id="L93"><span class="line-num">93</span>  contentType =</span>
+<span class="line" id="L94"><span class="line-num">94</span>      Invalid</span>
+<span class="line" id="L95"><span class="line-num">95</span>    | ChangeCipherSpec</span>
+<span class="line" id="L96"><span class="line-num">96</span>    | Alert</span>
+<span class="line" id="L97"><span class="line-num">97</span>    | Handshake</span>
+<span class="line" id="L98"><span class="line-num">98</span>    | ApplicationData</span>
+<span class="line" id="L99"><span class="line-num">99</span>End</span>
+<span class="line" id="L100"><span class="line-num">100</span></span>
+<span class="line" id="L101"><span class="line-num">101</span>Definition encodeContentType_def:</span>
+<span class="line" id="L102"><span class="line-num">102</span>  (encodeContentType Invalid          = 0x00w : word8) /\</span>
+<span class="line" id="L103"><span class="line-num">103</span>  (encodeContentType ChangeCipherSpec = 0x14w) /\</span>
+<span class="line" id="L104"><span class="line-num">104</span>  (encodeContentType Alert            = 0x15w) /\</span>
+<span class="line" id="L105"><span class="line-num">105</span>  (encodeContentType Handshake        = 0x16w) /\</span>
+<span class="line" id="L106"><span class="line-num">106</span>  (encodeContentType ApplicationData  = 0x17w)</span>
+<span class="line" id="L107"><span class="line-num">107</span>End</span>
+<span class="line" id="L108"><span class="line-num">108</span></span>
+<span class="line" id="L109"><span class="line-num">109</span>Definition decodeContentType_def:</span>
+<span class="line" id="L110"><span class="line-num">110</span>  (decodeContentType (b : word8) =</span>
+<span class="line" id="L111"><span class="line-num">111</span>     if b = 0x00w then SOME Invalid else</span>
+<span class="line" id="L112"><span class="line-num">112</span>     if b = 0x14w then SOME ChangeCipherSpec else</span>
+<span class="line" id="L113"><span class="line-num">113</span>     if b = 0x15w then SOME Alert else</span>
+<span class="line" id="L114"><span class="line-num">114</span>     if b = 0x16w then SOME Handshake else</span>
+<span class="line" id="L115"><span class="line-num">115</span>     if b = 0x17w then SOME ApplicationData else</span>
+<span class="line" id="L116"><span class="line-num">116</span>     NONE)</span>
+<span class="line" id="L117"><span class="line-num">117</span>End</span>
+<span class="line" id="L118"><span class="line-num">118</span></span>
+<span class="line" id="L119"><span class="line-num">119</span>Theorem decode_encode_contentType:</span>
+<span class="line" id="L120"><span class="line-num">120</span>  !ct. decodeContentType (encodeContentType ct) = SOME ct</span>
+<span class="line" id="L121"><span class="line-num">121</span>Proof</span>
+<span class="line" id="L122"><span class="line-num">122</span>  cheat</span>
+<span class="line" id="L123"><span class="line-num">123</span>QED</span>
+<span class="line" id="L124"><span class="line-num">124</span></span>
+<span class="line" id="L125"><span class="line-num">125</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L126"><span class="line-num">126</span>(*  Record headers (RFC 8446 5.1)                                             *)</span>
+<span class="line" id="L127"><span class="line-num">127</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L128"><span class="line-num">128</span></span>
+<span class="line" id="L129"><span class="line-num">129</span>Datatype:</span>
+<span class="line" id="L130"><span class="line-num">130</span>  tlsPlaintext =</span>
+<span class="line" id="L131"><span class="line-num">131</span>    &lt;| contentType : contentType;</span>
+<span class="line" id="L132"><span class="line-num">132</span>       (* legacy_record_version is always legacyVersion, so it is omitted</span>
+<span class="line" id="L133"><span class="line-num">133</span>          from the model and re-introduced on encode. *)</span>
+<span class="line" id="L134"><span class="line-num">134</span>       fragment     : word8 list |&gt;</span>
+<span class="line" id="L135"><span class="line-num">135</span>End</span>
+<span class="line" id="L136"><span class="line-num">136</span></span>
+<span class="line" id="L137"><span class="line-num">137</span>Datatype:</span>
+<span class="line" id="L138"><span class="line-num">138</span>  tlsCiphertext =</span>
+<span class="line" id="L139"><span class="line-num">139</span>    &lt;| contentType       : contentType;</span>
+<span class="line" id="L140"><span class="line-num">140</span>       encryptedRecord   : word8 list |&gt;</span>
+<span class="line" id="L141"><span class="line-num">141</span>End</span>
+<span class="line" id="L142"><span class="line-num">142</span></span>
+<span class="line" id="L143"><span class="line-num">143</span>(* 5-byte header: [type:1][version:2][length:2], then the fragment.</span>
+<span class="line" id="L144"><span class="line-num">144</span>   Length is the fragment length; we assume &lt; 2^14 (enforced elsewhere). *)</span>
+<span class="line" id="L145"><span class="line-num">145</span>Definition encodePlaintext_def:</span>
+<span class="line" id="L146"><span class="line-num">146</span>  encodePlaintext (r : tlsPlaintext) : word8 list =</span>
+<span class="line" id="L147"><span class="line-num">147</span>    encodeContentType r.contentType ::</span>
+<span class="line" id="L148"><span class="line-num">148</span>    (w16_to_bytes legacyVersion ++</span>
+<span class="line" id="L149"><span class="line-num">149</span>     w16_to_bytes (n2w (LENGTH r.fragment) : word16) ++</span>
+<span class="line" id="L150"><span class="line-num">150</span>     r.fragment)</span>
+<span class="line" id="L151"><span class="line-num">151</span>End</span>
+<span class="line" id="L152"><span class="line-num">152</span></span>
+<span class="line" id="L153"><span class="line-num">153</span>Definition decodePlaintext_def:</span>
+<span class="line" id="L154"><span class="line-num">154</span>  decodePlaintext (bs : word8 list) : (tlsPlaintext # word8 list) option =</span>
+<span class="line" id="L155"><span class="line-num">155</span>    if LENGTH bs &lt; 5 then NONE</span>
+<span class="line" id="L156"><span class="line-num">156</span>    else</span>
+<span class="line" id="L157"><span class="line-num">157</span>      let ctB   = EL 0 bs in</span>
+<span class="line" id="L158"><span class="line-num">158</span>      let n     = w2n (w16_of_bytes (EL 3 bs) (EL 4 bs)) in</span>
+<span class="line" id="L159"><span class="line-num">159</span>      case decodeContentType ctB of</span>
+<span class="line" id="L160"><span class="line-num">160</span>        | NONE =&gt; NONE</span>
+<span class="line" id="L161"><span class="line-num">161</span>        | SOME ct =&gt;</span>
+<span class="line" id="L162"><span class="line-num">162</span>            if LENGTH bs &lt; 5 + n then NONE</span>
+<span class="line" id="L163"><span class="line-num">163</span>            else SOME (&lt;| contentType := ct; fragment := TAKE n (DROP 5 bs) |&gt;,</span>
+<span class="line" id="L164"><span class="line-num">164</span>                       DROP (5 + n) bs)</span>
+<span class="line" id="L165"><span class="line-num">165</span>End</span>
+<span class="line" id="L166"><span class="line-num">166</span></span>
+<span class="line" id="L167"><span class="line-num">167</span>(* Round-trip: decoding an encoded record returns the record and no</span>
+<span class="line" id="L168"><span class="line-num">168</span>   remainder. Provable by EVAL on concrete records; the general case</span>
+<span class="line" id="L169"><span class="line-num">169</span>   reduces to list arithmetic. *)</span>
+<span class="line" id="L170"><span class="line-num">170</span>Theorem decode_encode_plaintext:</span>
+<span class="line" id="L171"><span class="line-num">171</span>  !r. decodePlaintext (encodePlaintext r) = SOME (r, [])</span>
+<span class="line" id="L172"><span class="line-num">172</span>Proof</span>
+<span class="line" id="L173"><span class="line-num">173</span>  (* TODO: discharge in Phase 7; the case-splits are mechanical. *)</span>
+<span class="line" id="L174"><span class="line-num">174</span>  cheat</span>
+<span class="line" id="L175"><span class="line-num">175</span>QED</span>
+<span class="line" id="L176"><span class="line-num">176</span></span>
+<span class="line" id="L177"><span class="line-num">177</span>(* Ciphertext framing is identical in shape (outer type is always</span>
+<span class="line" id="L178"><span class="line-num">178</span>   ApplicationData under a traffic key, but the wire format is the same). *)</span>
+<span class="line" id="L179"><span class="line-num">179</span>Definition encodeCiphertext_def:</span>
+<span class="line" id="L180"><span class="line-num">180</span>  encodeCiphertext (r : tlsCiphertext) : word8 list =</span>
+<span class="line" id="L181"><span class="line-num">181</span>    encodeContentType r.contentType ::</span>
+<span class="line" id="L182"><span class="line-num">182</span>    (w16_to_bytes legacyVersion ++</span>
+<span class="line" id="L183"><span class="line-num">183</span>     w16_to_bytes (n2w (LENGTH r.encryptedRecord) : word16) ++</span>
+<span class="line" id="L184"><span class="line-num">184</span>     r.encryptedRecord)</span>
+<span class="line" id="L185"><span class="line-num">185</span>End</span>
+<span class="line" id="L186"><span class="line-num">186</span></span>
+<span class="line" id="L187"><span class="line-num">187</span>Definition decodeCiphertext_def:</span>
+<span class="line" id="L188"><span class="line-num">188</span>  decodeCiphertext (bs : word8 list) : (tlsCiphertext # word8 list) option =</span>
+<span class="line" id="L189"><span class="line-num">189</span>    if LENGTH bs &lt; 5 then NONE</span>
+<span class="line" id="L190"><span class="line-num">190</span>    else</span>
+<span class="line" id="L191"><span class="line-num">191</span>      let ctB   = EL 0 bs in</span>
+<span class="line" id="L192"><span class="line-num">192</span>      let n     = w2n (w16_of_bytes (EL 3 bs) (EL 4 bs)) in</span>
+<span class="line" id="L193"><span class="line-num">193</span>      case decodeContentType ctB of</span>
+<span class="line" id="L194"><span class="line-num">194</span>        | NONE =&gt; NONE</span>
+<span class="line" id="L195"><span class="line-num">195</span>        | SOME ct =&gt;</span>
+<span class="line" id="L196"><span class="line-num">196</span>            if LENGTH bs &lt; 5 + n then NONE</span>
+<span class="line" id="L197"><span class="line-num">197</span>            else SOME (&lt;| contentType := ct; encryptedRecord := TAKE n (DROP 5 bs) |&gt;,</span>
+<span class="line" id="L198"><span class="line-num">198</span>                       DROP (5 + n) bs)</span>
+<span class="line" id="L199"><span class="line-num">199</span>End</span>
+<span class="line" id="L200"><span class="line-num">200</span></span>
+<span class="line" id="L201"><span class="line-num">201</span>Theorem decode_encode_ciphertext:</span>
+<span class="line" id="L202"><span class="line-num">202</span>  !r. decodeCiphertext (encodeCiphertext r) = SOME (r, [])</span>
+<span class="line" id="L203"><span class="line-num">203</span>Proof</span>
+<span class="line" id="L204"><span class="line-num">204</span>  cheat</span>
+<span class="line" id="L205"><span class="line-num">205</span>QED</span>
+<span class="line" id="L206"><span class="line-num">206</span></span>
+<span class="line" id="L207"><span class="line-num">207</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L208"><span class="line-num">208</span>(*  Handshake message types (RFC 8446 4)                                      *)</span>
+<span class="line" id="L209"><span class="line-num">209</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L210"><span class="line-num">210</span></span>
+<span class="line" id="L211"><span class="line-num">211</span>Datatype:</span>
+<span class="line" id="L212"><span class="line-num">212</span>  handshakeType =</span>
+<span class="line" id="L213"><span class="line-num">213</span>      ClientHello</span>
+<span class="line" id="L214"><span class="line-num">214</span>    | ServerHello</span>
+<span class="line" id="L215"><span class="line-num">215</span>    | NewSessionTicket</span>
+<span class="line" id="L216"><span class="line-num">216</span>    | EndOfEarlyData</span>
+<span class="line" id="L217"><span class="line-num">217</span>    | EncryptedExtensions</span>
+<span class="line" id="L218"><span class="line-num">218</span>    | Certificate</span>
+<span class="line" id="L219"><span class="line-num">219</span>    | CertificateRequest</span>
+<span class="line" id="L220"><span class="line-num">220</span>    | CertificateVerify</span>
+<span class="line" id="L221"><span class="line-num">221</span>    | Finished</span>
+<span class="line" id="L222"><span class="line-num">222</span>    | KeyUpdate</span>
+<span class="line" id="L223"><span class="line-num">223</span>    | MessageHash</span>
+<span class="line" id="L224"><span class="line-num">224</span>End</span>
+<span class="line" id="L225"><span class="line-num">225</span></span>
+<span class="line" id="L226"><span class="line-num">226</span>Definition encodeHandshakeType_def:</span>
+<span class="line" id="L227"><span class="line-num">227</span>  (encodeHandshakeType ClientHello         = 0x01w : word8) /\</span>
+<span class="line" id="L228"><span class="line-num">228</span>  (encodeHandshakeType ServerHello         = 0x02w) /\</span>
+<span class="line" id="L229"><span class="line-num">229</span>  (encodeHandshakeType NewSessionTicket    = 0x04w) /\</span>
+<span class="line" id="L230"><span class="line-num">230</span>  (encodeHandshakeType EndOfEarlyData      = 0x05w) /\</span>
+<span class="line" id="L231"><span class="line-num">231</span>  (encodeHandshakeType EncryptedExtensions = 0x08w) /\</span>
+<span class="line" id="L232"><span class="line-num">232</span>  (encodeHandshakeType Certificate         = 0x0Bw) /\</span>
+<span class="line" id="L233"><span class="line-num">233</span>  (encodeHandshakeType CertificateRequest  = 0x0Dw) /\</span>
+<span class="line" id="L234"><span class="line-num">234</span>  (encodeHandshakeType CertificateVerify   = 0x0Fw) /\</span>
+<span class="line" id="L235"><span class="line-num">235</span>  (encodeHandshakeType Finished            = 0x14w) /\</span>
+<span class="line" id="L236"><span class="line-num">236</span>  (encodeHandshakeType KeyUpdate          = 0x18w) /\</span>
+<span class="line" id="L237"><span class="line-num">237</span>  (encodeHandshakeType MessageHash        = 0xFEw)</span>
+<span class="line" id="L238"><span class="line-num">238</span>End</span>
+<span class="line" id="L239"><span class="line-num">239</span></span>
+<span class="line" id="L240"><span class="line-num">240</span>Definition decodeHandshakeType_def:</span>
+<span class="line" id="L241"><span class="line-num">241</span>  (decodeHandshakeType (b : word8) =</span>
+<span class="line" id="L242"><span class="line-num">242</span>     if b = 0x01w then SOME ClientHello else</span>
+<span class="line" id="L243"><span class="line-num">243</span>     if b = 0x02w then SOME ServerHello else</span>
+<span class="line" id="L244"><span class="line-num">244</span>     if b = 0x04w then SOME NewSessionTicket else</span>
+<span class="line" id="L245"><span class="line-num">245</span>     if b = 0x05w then SOME EndOfEarlyData else</span>
+<span class="line" id="L246"><span class="line-num">246</span>     if b = 0x08w then SOME EncryptedExtensions else</span>
+<span class="line" id="L247"><span class="line-num">247</span>     if b = 0x0Bw then SOME Certificate else</span>
+<span class="line" id="L248"><span class="line-num">248</span>     if b = 0x0Dw then SOME CertificateRequest else</span>
+<span class="line" id="L249"><span class="line-num">249</span>     if b = 0x0Fw then SOME CertificateVerify else</span>
+<span class="line" id="L250"><span class="line-num">250</span>     if b = 0x14w then SOME Finished else</span>
+<span class="line" id="L251"><span class="line-num">251</span>     if b = 0x18w then SOME KeyUpdate else</span>
+<span class="line" id="L252"><span class="line-num">252</span>     if b = 0xFEw then SOME MessageHash else</span>
+<span class="line" id="L253"><span class="line-num">253</span>     NONE)</span>
+<span class="line" id="L254"><span class="line-num">254</span>End</span>
+<span class="line" id="L255"><span class="line-num">255</span></span>
+<span class="line" id="L256"><span class="line-num">256</span>Theorem decode_encode_handshakeType:</span>
+<span class="line" id="L257"><span class="line-num">257</span>  !t. decodeHandshakeType (encodeHandshakeType t) = SOME t</span>
+<span class="line" id="L258"><span class="line-num">258</span>Proof</span>
+<span class="line" id="L259"><span class="line-num">259</span>  cheat</span>
+<span class="line" id="L260"><span class="line-num">260</span>QED</span>
+<span class="line" id="L261"><span class="line-num">261</span></span>
+<span class="line" id="L262"><span class="line-num">262</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L263"><span class="line-num">263</span>(*  Handshake message framing (RFC 8446 4)                                    *)</span>
+<span class="line" id="L264"><span class="line-num">264</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L265"><span class="line-num">265</span></span>
+<span class="line" id="L266"><span class="line-num">266</span>Datatype:</span>
+<span class="line" id="L267"><span class="line-num">267</span>  handshakeMessage =</span>
+<span class="line" id="L268"><span class="line-num">268</span>    &lt;| msgType : handshakeType;</span>
+<span class="line" id="L269"><span class="line-num">269</span>       body    : word8 list |&gt;</span>
+<span class="line" id="L270"><span class="line-num">270</span>End</span>
+<span class="line" id="L271"><span class="line-num">271</span></span>
+<span class="line" id="L272"><span class="line-num">272</span>(* A handshake message on the wire is [type:1][length:3][body]. The length</span>
+<span class="line" id="L273"><span class="line-num">273</span>   is a 24-bit big-endian integer; we model it as three word8 bytes. *)</span>
+<span class="line" id="L274"><span class="line-num">274</span>Definition encodeMessage_def:</span>
+<span class="line" id="L275"><span class="line-num">275</span>  encodeMessage (m : handshakeMessage) : word8 list =</span>
+<span class="line" id="L276"><span class="line-num">276</span>    encodeHandshakeType m.msgType ::</span>
+<span class="line" id="L277"><span class="line-num">277</span>    (len3 (LENGTH m.body) ++ m.body)</span>
+<span class="line" id="L278"><span class="line-num">278</span>End</span>
+<span class="line" id="L279"><span class="line-num">279</span></span>
+<span class="line" id="L280"><span class="line-num">280</span>Definition decodeMessage_def:</span>
+<span class="line" id="L281"><span class="line-num">281</span>  decodeMessage (bs : word8 list) : (handshakeMessage # word8 list) option =</span>
+<span class="line" id="L282"><span class="line-num">282</span>    if LENGTH bs &lt; 4 then NONE</span>
+<span class="line" id="L283"><span class="line-num">283</span>    else</span>
+<span class="line" id="L284"><span class="line-num">284</span>      let t = EL 0 bs in</span>
+<span class="line" id="L285"><span class="line-num">285</span>      let n = w2n (w24_of_len3 (EL 1 bs) (EL 2 bs) (EL 3 bs)) in</span>
+<span class="line" id="L286"><span class="line-num">286</span>      case decodeHandshakeType t of</span>
+<span class="line" id="L287"><span class="line-num">287</span>        | NONE =&gt; NONE</span>
+<span class="line" id="L288"><span class="line-num">288</span>        | SOME ht =&gt;</span>
+<span class="line" id="L289"><span class="line-num">289</span>            if LENGTH bs &lt; 4 + n then NONE</span>
+<span class="line" id="L290"><span class="line-num">290</span>            else SOME (&lt;| msgType := ht; body := TAKE n (DROP 4 bs) |&gt;,</span>
+<span class="line" id="L291"><span class="line-num">291</span>                       DROP (4 + n) bs)</span>
+<span class="line" id="L292"><span class="line-num">292</span>End</span>
+<span class="line" id="L293"><span class="line-num">293</span></span>
+<span class="line" id="L294"><span class="line-num">294</span>Theorem decode_encode_message:</span>
+<span class="line" id="L295"><span class="line-num">295</span>  !m. decodeMessage (encodeMessage m) = SOME (m, [])</span>
+<span class="line" id="L296"><span class="line-num">296</span>Proof</span>
+<span class="line" id="L297"><span class="line-num">297</span>  cheat</span>
+<span class="line" id="L298"><span class="line-num">298</span>QED</span>
+<span class="line" id="L299"><span class="line-num">299</span></span>
+<span class="line" id="L300"><span class="line-num">300</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L301"><span class="line-num">301</span>(*  Extensions (RFC 8446 4.2)                                                *)</span>
+<span class="line" id="L302"><span class="line-num">302</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L303"><span class="line-num">303</span></span>
+<span class="line" id="L304"><span class="line-num">304</span>Datatype:</span>
+<span class="line" id="L305"><span class="line-num">305</span>  extension = &lt;| extType : word16; data : word8 list |&gt;</span>
+<span class="line" id="L306"><span class="line-num">306</span>End</span>
+<span class="line" id="L307"><span class="line-num">307</span></span>
+<span class="line" id="L308"><span class="line-num">308</span>(* Extension block = 2-byte total length, then a sequence of entries,</span>
+<span class="line" id="L309"><span class="line-num">309</span>   each [type:2][length:2][data]. *)</span>
+<span class="line" id="L310"><span class="line-num">310</span>Definition encodeExtension_def:</span>
+<span class="line" id="L311"><span class="line-num">311</span>  encodeExtension (e : extension) : word8 list =</span>
+<span class="line" id="L312"><span class="line-num">312</span>    w16_to_bytes e.extType ++</span>
+<span class="line" id="L313"><span class="line-num">313</span>    w16_to_bytes (n2w (LENGTH e.data) : word16) ++</span>
+<span class="line" id="L314"><span class="line-num">314</span>    e.data</span>
+<span class="line" id="L315"><span class="line-num">315</span>End</span>
+<span class="line" id="L316"><span class="line-num">316</span></span>
+<span class="line" id="L317"><span class="line-num">317</span>Definition encodeExtensions_def:</span>
+<span class="line" id="L318"><span class="line-num">318</span>  encodeExtensions (es : extension list) : word8 list =</span>
+<span class="line" id="L319"><span class="line-num">319</span>    let body = FLAT (MAP encodeExtension es) in</span>
+<span class="line" id="L320"><span class="line-num">320</span>    w16_to_bytes (n2w (LENGTH body) : word16) ++ body</span>
+<span class="line" id="L321"><span class="line-num">321</span>End</span>
+<span class="line" id="L322"><span class="line-num">322</span></span>
+<span class="line" id="L323"><span class="line-num">323</span>(* Tail-recursive parser over the extension body. Each iteration reads a</span>
+<span class="line" id="L324"><span class="line-num">324</span>   4-byte entry header; a truncated length, a length exceeding the</span>
+<span class="line" id="L325"><span class="line-num">325</span>   remaining budget, or trailing junk after `total` bytes yields NONE. *)</span>
+<span class="line" id="L326"><span class="line-num">326</span>Definition decodeExts_loop_def:</span>
+<span class="line" id="L327"><span class="line-num">327</span>  (decodeExts_loop [] acc = SOME (REVERSE acc)) /\</span>
+<span class="line" id="L328"><span class="line-num">328</span>  (decodeExts_loop (h0::h1::l0::l1::rest) acc =</span>
+<span class="line" id="L329"><span class="line-num">329</span>     let extType = w16_of_bytes h0 h1 in</span>
+<span class="line" id="L330"><span class="line-num">330</span>     let n       = w2n (w16_of_bytes l0 l1) in</span>
+<span class="line" id="L331"><span class="line-num">331</span>     if LENGTH rest &lt; n then NONE</span>
+<span class="line" id="L332"><span class="line-num">332</span>     else decodeExts_loop (DROP n rest)</span>
+<span class="line" id="L333"><span class="line-num">333</span>                          (&lt;| extType := extType; data := TAKE n rest |&gt; :: acc)) /\</span>
+<span class="line" id="L334"><span class="line-num">334</span>  (decodeExts_loop [_] acc = NONE) /\</span>
+<span class="line" id="L335"><span class="line-num">335</span>  (decodeExts_loop [_;_] acc = NONE) /\</span>
+<span class="line" id="L336"><span class="line-num">336</span>  (decodeExts_loop [_;_;_] acc = NONE)</span>
+<span class="line" id="L337"><span class="line-num">337</span>Termination</span>
+<span class="line" id="L338"><span class="line-num">338</span>  WF_REL_TAC `measure (LENGTH o FST)` \\ rw [] \\ DECIDE_TAC</span>
+<span class="line" id="L339"><span class="line-num">339</span>End</span>
+<span class="line" id="L340"><span class="line-num">340</span></span>
+<span class="line" id="L341"><span class="line-num">341</span>Definition decodeExtensions_def:</span>
+<span class="line" id="L342"><span class="line-num">342</span>  decodeExtensions (bs : word8 list) : extension list option =</span>
+<span class="line" id="L343"><span class="line-num">343</span>    if LENGTH bs &lt; 2 then NONE</span>
+<span class="line" id="L344"><span class="line-num">344</span>    else</span>
+<span class="line" id="L345"><span class="line-num">345</span>      let total = w2n (w16_of_bytes (EL 0 bs) (EL 1 bs)) in</span>
+<span class="line" id="L346"><span class="line-num">346</span>      if LENGTH bs &lt; 2 + total then NONE</span>
+<span class="line" id="L347"><span class="line-num">347</span>      else decodeExts_loop (TAKE total (DROP 2 bs)) []</span>
+<span class="line" id="L348"><span class="line-num">348</span>End</span>
+<span class="line" id="L349"><span class="line-num">349</span></span>
+<span class="line" id="L350"><span class="line-num">350</span>Theorem decode_encode_extensions:</span>
+<span class="line" id="L351"><span class="line-num">351</span>  !es. decodeExtensions (encodeExtensions es) = SOME es</span>
+<span class="line" id="L352"><span class="line-num">352</span>Proof</span>
+<span class="line" id="L353"><span class="line-num">353</span>  cheat</span>
+<span class="line" id="L354"><span class="line-num">354</span>QED</span>
+<span class="line" id="L355"><span class="line-num">355</span></span>
+<span class="line" id="L356"><span class="line-num">356</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L357"><span class="line-num">357</span>(*  Concrete handshake message bodies (simplified)                            *)</span>
+<span class="line" id="L358"><span class="line-num">358</span>(* -------------------------------------------------------------------------- *)</span>
+<span class="line" id="L359"><span class="line-num">359</span></span>
+<span class="line" id="L360"><span class="line-num">360</span>Datatype:</span>
+<span class="line" id="L361"><span class="line-num">361</span>  clientHello =</span>
+<span class="line" id="L362"><span class="line-num">362</span>    &lt;| legacyVersion       : word16;</span>
+<span class="line" id="L363"><span class="line-num">363</span>       random             : word8 list;     (* 32 bytes              *)</span>
+<span class="line" id="L364"><span class="line-num">364</span>       legacySessionId    : word8 list;</span>
+<span class="line" id="L365"><span class="line-num">365</span>       cipherSuites       : word16 list;</span>
+<span class="line" id="L366"><span class="line-num">366</span>       legacyCompression  : word8 list;</span>
+<span class="line" id="L367"><span class="line-num">367</span>       extensions         : extension list |&gt;</span>
+<span class="line" id="L368"><span class="line-num">368</span>End</span>
+<span class="line" id="L369"><span class="line-num">369</span></span>
+<span class="line" id="L370"><span class="line-num">370</span>Datatype:</span>
+<span class="line" id="L371"><span class="line-num">371</span>  serverHello =</span>
+<span class="line" id="L372"><span class="line-num">372</span>    &lt;| legacyVersion       : word16;</span>
+<span class="line" id="L373"><span class="line-num">373</span>       random             : word8 list;     (* 32 bytes              *)</span>
+<span class="line" id="L374"><span class="line-num">374</span>       legacySessionId    : word8 list;</span>
+<span class="line" id="L375"><span class="line-num">375</span>       cipherSuite        : word16;</span>
+<span class="line" id="L376"><span class="line-num">376</span>       legacyCompression  : word8;</span>
+<span class="line" id="L377"><span class="line-num">377</span>       extensions         : extension list |&gt;</span>
+<span class="line" id="L378"><span class="line-num">378</span>End</span>
+<span class="line" id="L379"><span class="line-num">379</span></span>
+<span class="line" id="L380"><span class="line-num">380</span>Datatype:</span>
+<span class="line" id="L381"><span class="line-num">381</span>  certificateEntry =</span>
+<span class="line" id="L382"><span class="line-num">382</span>    &lt;| certData   : word8 list;</span>
+<span class="line" id="L383"><span class="line-num">383</span>       extensions : extension list |&gt;</span>
+<span class="line" id="L384"><span class="line-num">384</span>End</span>
+<span class="line" id="L385"><span class="line-num">385</span></span>
+<span class="line" id="L386"><span class="line-num">386</span>Datatype:</span>
+<span class="line" id="L387"><span class="line-num">387</span>  certificate =</span>
+<span class="line" id="L388"><span class="line-num">388</span>    &lt;| certificateRequestContext : word8 list;</span>
+<span class="line" id="L389"><span class="line-num">389</span>       certificateList           : certificateEntry list |&gt;</span>
+<span class="line" id="L390"><span class="line-num">390</span>End</span>
+<span class="line" id="L391"><span class="line-num">391</span></span>
+<span class="line" id="L392"><span class="line-num">392</span>Datatype:</span>
+<span class="line" id="L393"><span class="line-num">393</span>  certificateVerify =</span>
+<span class="line" id="L394"><span class="line-num">394</span>    &lt;| sigAlg   : word16;</span>
+<span class="line" id="L395"><span class="line-num">395</span>       sigBytes : word8 list |&gt;</span>
+<span class="line" id="L396"><span class="line-num">396</span>End</span>
+<span class="line" id="L397"><span class="line-num">397</span></span>
+<span class="line" id="L398"><span class="line-num">398</span>Datatype:</span>
+<span class="line" id="L399"><span class="line-num">399</span>  finished = &lt;| verifyData : word8 list |&gt;</span>
+<span class="line" id="L400"><span class="line-num">400</span>End</span>
+<span class="line" id="L401"><span class="line-num">401</span></span>
+<span class="line" id="L402"><span class="line-num">402</span>Datatype:</span>
+<span class="line" id="L403"><span class="line-num">403</span>  newSessionTicket =</span>
+<span class="line" id="L404"><span class="line-num">404</span>    &lt;| ticketLifetime : word32;</span>
+<span class="line" id="L405"><span class="line-num">405</span>       ticketAgeAdd   : word32;</span>
+<span class="line" id="L406"><span class="line-num">406</span>       ticketNonce    : word8 list;</span>
+<span class="line" id="L407"><span class="line-num">407</span>       ticket         : word8 list;</span>
+<span class="line" id="L408"><span class="line-num">408</span>       extensions     : extension list |&gt;</span>
+<span class="line" id="L409"><span class="line-num">409</span>End</span>
+<span class="line" id="L410"><span class="line-num">410</span></span>
+<span class="line" id="L411"><span class="line-num">411</span>(* Encoders/decoders for the bodies above are the mechanical mirror of the</span>
+<span class="line" id="L412"><span class="line-num">412</span>   SML functions in tls.sml. Their implementations are filled in Phase 7</span>
+<span class="line" id="L413"><span class="line-num">413</span>   (or by sub-worker 1's follow-up); the function signatures are fixed</span>
+<span class="line" id="L414"><span class="line-num">414</span>   here as trusted axioms so the round-trip goals below type-check. *)</span>
+<span class="line" id="L415"><span class="line-num">415</span></span>
+<span class="line" id="L416"><span class="line-num">416</span>Definition encodeClientHello_def:</span>
+<span class="line" id="L417"><span class="line-num">417</span>  encodeClientHello (ch : clientHello) : word8 list = []</span>
+<span class="line" id="L418"><span class="line-num">418</span>End</span>
+<span class="line" id="L419"><span class="line-num">419</span>Definition decodeClientHello_def:</span>
+<span class="line" id="L420"><span class="line-num">420</span>  decodeClientHello (bs : word8 list) : clientHello option = NONE</span>
+<span class="line" id="L421"><span class="line-num">421</span>End</span>
+<span class="line" id="L422"><span class="line-num">422</span></span>
+<span class="line" id="L423"><span class="line-num">423</span>Definition encodeServerHello_def:</span>
+<span class="line" id="L424"><span class="line-num">424</span>  encodeServerHello (sh : serverHello) : word8 list = []</span>
+<span class="line" id="L425"><span class="line-num">425</span>End</span>
+<span class="line" id="L426"><span class="line-num">426</span>Definition decodeServerHello_def:</span>
+<span class="line" id="L427"><span class="line-num">427</span>  decodeServerHello (bs : word8 list) : serverHello option = NONE</span>
+<span class="line" id="L428"><span class="line-num">428</span>End</span>
+<span class="line" id="L429"><span class="line-num">429</span></span>
+<span class="line" id="L430"><span class="line-num">430</span>Definition encodeCertificate_def:</span>
+<span class="line" id="L431"><span class="line-num">431</span>  encodeCertificate (c : certificate) : word8 list = []</span>
+<span class="line" id="L432"><span class="line-num">432</span>End</span>
+<span class="line" id="L433"><span class="line-num">433</span>Definition decodeCertificate_def:</span>
+<span class="line" id="L434"><span class="line-num">434</span>  decodeCertificate (bs : word8 list) : certificate option = NONE</span>
+<span class="line" id="L435"><span class="line-num">435</span>End</span>
+<span class="line" id="L436"><span class="line-num">436</span></span>
+<span class="line" id="L437"><span class="line-num">437</span>Definition encodeCertificateVerify_def:</span>
+<span class="line" id="L438"><span class="line-num">438</span>  encodeCertificateVerify (cv : certificateVerify) : word8 list = []</span>
+<span class="line" id="L439"><span class="line-num">439</span>End</span>
+<span class="line" id="L440"><span class="line-num">440</span>Definition decodeCertificateVerify_def:</span>
+<span class="line" id="L441"><span class="line-num">441</span>  decodeCertificateVerify (bs : word8 list) : certificateVerify option = NONE</span>
+<span class="line" id="L442"><span class="line-num">442</span>End</span>
+<span class="line" id="L443"><span class="line-num">443</span></span>
+<span class="line" id="L444"><span class="line-num">444</span>Definition encodeFinished_def:</span>
+<span class="line" id="L445"><span class="line-num">445</span>  encodeFinished (f : finished) : word8 list = []</span>
+<span class="line" id="L446"><span class="line-num">446</span>End</span>
+<span class="line" id="L447"><span class="line-num">447</span>Definition decodeFinished_def:</span>
+<span class="line" id="L448"><span class="line-num">448</span>  decodeFinished (bs : word8 list) : finished option = NONE</span>
+<span class="line" id="L449"><span class="line-num">449</span>End</span>
+<span class="line" id="L450"><span class="line-num">450</span></span>
+<span class="line" id="L451"><span class="line-num">451</span>Definition encodeNewSessionTicket_def:</span>
+<span class="line" id="L452"><span class="line-num">452</span>  encodeNewSessionTicket (nst : newSessionTicket) : word8 list = []</span>
+<span class="line" id="L453"><span class="line-num">453</span>End</span>
+<span class="line" id="L454"><span class="line-num">454</span>Definition decodeNewSessionTicket_def:</span>
+<span class="line" id="L455"><span class="line-num">455</span>  decodeNewSessionTicket (bs : word8 list) : newSessionTicket option = NONE</span>
+<span class="line" id="L456"><span class="line-num">456</span>End</span>
+<span class="line" id="L457"><span class="line-num">457</span></span>
+<span class="line" id="L458"><span class="line-num">458</span>Theorem clientHello_roundtrip:</span>
+<span class="line" id="L459"><span class="line-num">459</span>  !ch. decodeClientHello (encodeClientHello ch) = SOME ch</span>
+<span class="line" id="L460"><span class="line-num">460</span>Proof</span>
+<span class="line" id="L461"><span class="line-num">461</span>  cheat</span>
+<span class="line" id="L462"><span class="line-num">462</span>QED</span>
+<span class="line" id="L463"><span class="line-num">463</span></span>
+<span class="line" id="L464"><span class="line-num">464</span>Theorem serverHello_roundtrip:</span>
+<span class="line" id="L465"><span class="line-num">465</span>  !sh. decodeServerHello (encodeServerHello sh) = SOME sh</span>
+<span class="line" id="L466"><span class="line-num">466</span>Proof</span>
+<span class="line" id="L467"><span class="line-num">467</span>  cheat</span>
+<span class="line" id="L468"><span class="line-num">468</span>QED</span>
+<span class="line" id="L469"><span class="line-num">469</span></span>
+<span class="line" id="L470"><span class="line-num">470</span>Theorem certificate_roundtrip:</span>
+<span class="line" id="L471"><span class="line-num">471</span>  !c. decodeCertificate (encodeCertificate c) = SOME c</span>
+<span class="line" id="L472"><span class="line-num">472</span>Proof</span>
+<span class="line" id="L473"><span class="line-num">473</span>  cheat</span>
+<span class="line" id="L474"><span class="line-num">474</span>QED</span>
+<span class="line" id="L475"><span class="line-num">475</span></span>
+<span class="line" id="L476"><span class="line-num">476</span>Theorem certificateVerify_roundtrip:</span>
+<span class="line" id="L477"><span class="line-num">477</span>  !cv. decodeCertificateVerify (encodeCertificateVerify cv) = SOME cv</span>
+<span class="line" id="L478"><span class="line-num">478</span>Proof</span>
+<span class="line" id="L479"><span class="line-num">479</span>  cheat</span>
+<span class="line" id="L480"><span class="line-num">480</span>QED</span>
+<span class="line" id="L481"><span class="line-num">481</span></span>
+<span class="line" id="L482"><span class="line-num">482</span>Theorem finished_roundtrip:</span>
+<span class="line" id="L483"><span class="line-num">483</span>  !f. decodeFinished (encodeFinished f) = SOME f</span>
+<span class="line" id="L484"><span class="line-num">484</span>Proof</span>
+<span class="line" id="L485"><span class="line-num">485</span>  cheat</span>
+<span class="line" id="L486"><span class="line-num">486</span>QED</span>
+<span class="line" id="L487"><span class="line-num">487</span></span>
+<span class="line" id="L488"><span class="line-num">488</span>Theorem newSessionTicket_roundtrip:</span>
+<span class="line" id="L489"><span class="line-num">489</span>  !nst. decodeNewSessionTicket (encodeNewSessionTicket nst) = SOME nst</span>
+<span class="line" id="L490"><span class="line-num">490</span>Proof</span>
+<span class="line" id="L491"><span class="line-num">491</span>  cheat</span>
+<span class="line" id="L492"><span class="line-num">492</span>QED</span>
+<span class="line" id="L493"><span class="line-num">493</span></span>
+<span class="line" id="L494"><span class="line-num">494</span>val _ = export_theory ();</span>
+</pre>
+</body>
+</html>

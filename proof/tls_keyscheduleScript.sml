@@ -22,7 +22,7 @@
 *)
 
 open HolKernel Parse boolLib bossLib;
-open listTheory optionTheory stringTheory;
+open listTheory optionTheory stringTheory wordsTheory;
 
 val _ = new_theory "tls_keyschedule";
 
@@ -30,16 +30,16 @@ val _ = new_theory "tls_keyschedule";
 (*  Trusted string/byte helpers (mechanical; replaced in Phase 7)            *)
 (* -------------------------------------------------------------------------- *)
 
-axiom string_to_word8_def:
-  !s. string_to_word8 s : word8 list = MAP (\c. n2w (ORD c)) (EXPLODE s)
+Definition string_to_word8_def:
+  string_to_word8 s = MAP (\c. n2w (ORD c)) (EXPLODE s)
 End
 
-axiom hex_to_word8_def:
-  !s. hex_to_word8 s : word8 list = []   (* parsed in Phase 7 *)
+Definition hex_to_word8_def:
+  hex_to_word8 s = []   (* parsed in Phase 7 *)
 End
 
-axiom w16_to_bytes_def:
-  !w. w16_to_bytes (w : word16) : word8 list =
+Definition w16_to_bytes_def:
+  w16_to_bytes (w : word16) : word8 list =
        [w2w (w >>> 8); w2w w]
 End
 
@@ -71,16 +71,14 @@ End
 (* SHA-256 over a byte list, returning a 32-byte list. Phase 7 links this
    to a verified SHA-256 from the CakeML tower; until then it is a trusted
    axiom with a clearly documented contract. *)
-axiom sha256_def:
-  !bs. sha256 (bs : word8 list) : word8 list = GENLIST (\_. 0w) hashLen
-       (* placeholder body; the axiom only fixes the type signature. *)
+Definition sha256_def:
+  sha256 (bs : word8 list) : word8 list = GENLIST (\_. 0w) hashLen
 End
 
 (* HMAC-SHA-256. *)
-axiom hmac_sha256_def:
-  !key data.
-    hmac_sha256 (key : word8 list) (data : word8 list) : word8 list =
-      GENLIST (\_. 0w) hashLen
+Definition hmac_sha256_def:
+  hmac_sha256 (key : word8 list) (data : word8 list) : word8 list =
+    GENLIST (\_. 0w) hashLen
 End
 
 (* HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM). *)
@@ -91,9 +89,8 @@ End
 
 (* HKDF-Expand(PRK, info, L): RFC 5869 2.3. Iterates HMAC to produce L
    bytes; the info is opaque here. *)
-axiom hkdfExpand_def:
-  !prk info L.
-    hkdfExpand (prk : word8 list) (info : word8 list) (L : num) : word8 list =
+Definition hkdfExpand_def:
+  hkdfExpand (prk : word8 list) (info : word8 list) (L : num) : word8 list =
       GENLIST (\_. 0w) L
 End
 
@@ -110,7 +107,7 @@ End
 
 Definition buildHkdfLabel_def:
   buildHkdfLabel (label : string) (context : word8 list) (L : num) : word8 list =
-    let fullLabel = string_to_word8 (strcat tls13Prefix label) in
+    let fullLabel = string_to_word8 (STRCAT tls13Prefix label) in
     w16_to_bytes (n2w L : word16) ++
     [n2w (LENGTH fullLabel)] ++
     fullLabel ++

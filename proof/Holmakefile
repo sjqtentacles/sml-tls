@@ -1,9 +1,9 @@
-(* Holmakefile for the sml-tls HOL4 verification tower (Track B1).
-
-   HOLDIR is provided by Holmake at invocation time. The theories here
-   depend only on the standard HOL4 basis (bool, list, option, num, word)
-   so no extra INCLUDES are needed for now. When the CakeML refinement
-   proofs (Phase 7) land, add the CakeML translator includes here. *)
+# Holmakefile for the sml-tls HOL4 verification tower (Track B1).
+#
+# HOLDIR is provided by Holmake at invocation time. The theories here
+# depend only on the standard HOL4 basis (bool, list, option, num, word)
+# so no extra INCLUDES are needed for now. When the CakeML refinement
+# proofs (Phase 7) land, add the CakeML translator includes here.
 
 all: $(DEFAULT_TARGETS)
 .PHONY: all

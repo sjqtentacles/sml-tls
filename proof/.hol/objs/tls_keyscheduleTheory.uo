@@ -1,0 +1,12 @@
+$(HOLDIR)/sigobj/Globals
+$(HOLDIR)/sigobj/Overlay
+$(HOLDIR)/sigobj/Symtab
+$(HOLDIR)/sigobj/Term
+$(HOLDIR)/sigobj/Theory
+$(HOLDIR)/sigobj/TheoryReader
+$(HOLDIR)/sigobj/Thm
+$(HOLDIR)/sigobj/Type
+$(HOLDIR)/sigobj/wordsTheory
+/Users/asarkisyan/Documents/sml-tls/proof/tls_keyscheduleTheory
+/Users/asarkisyan/Documents/sml-tls/proof/tls_keyscheduleTheory
+/Users/asarkisyan/Documents/sml-tls/proof/tls_keyscheduleTheory.sml
