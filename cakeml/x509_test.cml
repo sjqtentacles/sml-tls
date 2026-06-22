@@ -1,0 +1,1794 @@
+(* x509_test.cml -- self-contained RFC 5280 certificate-parsing vectors for
+   the CakeML X.509 port.
+
+   Inlines Sha256 + Asn1 + Base64/Pem + Rsa + X509 (canonical sources) plus a
+   driver.  The certificate chain (leaf -> intermediate -> root, the committed
+   test fixtures test/fixtures/certs/{leaf,intermediate,root}.der) is embedded
+   as hex.  Extracted fields (subject CN, full DN, validity, serial, the RSA
+   public key n/e) and the RSASSA-PKCS1-v1_5+SHA-256 signature verification of
+   each cert against its issuer are cross-checked against the ORIGINAL sml-x509
+   built with MLton (the oracle).  PASS only on exact match. *)
+
+structure Sha256 = struct
+
+  val mask32 : Word64.word = 0wxFFFFFFFF
+
+  fun add32 a b = Word64.andb (Word64.+ a b) mask32
+  fun andb a b = Word64.andb a b
+  fun orb  a b = Word64.orb a b
+  fun xorb a b = Word64.xorb a b
+  fun lsl32 a b = Word64.andb (Word64.<< a b) mask32
+  fun lsr a b = Word64.>> a b
+  fun notb w = Word64.xorb w mask32
+
+  fun rotr w n =
+    Word64.orb (Word64.>> w n) (Word64.andb (Word64.<< w (32 - n)) mask32)
+
+  val k : Word64.word Vector.vector = Vector.fromList
+    [0wx428a2f98,0wx71374491,0wxb5c0fbcf,0wxe9b5dba5,0wx3956c25b,0wx59f111f1,
+     0wx923f82a4,0wxab1c5ed5,0wxd807aa98,0wx12835b01,0wx243185be,0wx550c7dc3,
+     0wx72be5d74,0wx80deb1fe,0wx9bdc06a7,0wxc19bf174,0wxe49b69c1,0wxefbe4786,
+     0wx0fc19dc6,0wx240ca1cc,0wx2de92c6f,0wx4a7484aa,0wx5cb0a9dc,0wx76f988da,
+     0wx983e5152,0wxa831c66d,0wxb00327c8,0wxbf597fc7,0wxc6e00bf3,0wxd5a79147,
+     0wx06ca6351,0wx14292967,0wx27b70a85,0wx2e1b2138,0wx4d2c6dfc,0wx53380d13,
+     0wx650a7354,0wx766a0abb,0wx81c2c92e,0wx92722c85,0wxa2bfe8a1,0wxa81a664b,
+     0wxc24b8b70,0wxc76c51a3,0wxd192e819,0wxd6990624,0wxf40e3585,0wx106aa070,
+     0wx19a4c116,0wx1e376c08,0wx2748774c,0wx34b0bcb5,0wx391c0cb3,0wx4ed8aa4a,
+     0wx5b9cca4f,0wx682e6ff3,0wx748f82ee,0wx78a5636f,0wx84c87814,0wx8cc70208,
+     0wx90befffa,0wxa4506ceb,0wxbef9a3f7,0wxc67178f2]
+
+  fun shiftFactor i =
+    if i = 0 then 1
+    else if i = 1 then 256
+    else if i = 2 then 65536
+    else if i = 3 then 16777216
+    else if i = 4 then 4294967296
+    else if i = 5 then 1099511627776
+    else if i = 6 then 281474976710656
+    else 72057594037927936
+
+  fun padded (msg : string) =
+    let
+      val len = String.size msg
+      val bitLen = len * 8
+      val withOne = msg ^ String.str (Char.chr 0x80)
+      val padZeros : int =
+        let val m = String.size withOne mod 64
+        in if m <= 56 then 56 - m else 120 - m end
+      val zeros = String.implode (List.tabulate padZeros (fn _ => Char.chr 0))
+      fun lenByte i = Char.chr ((bitLen div shiftFactor i) mod 256)
+      val lenBytes = String.implode (List.map lenByte [7,6,5,4,3,2,1,0])
+      val full = withOne ^ zeros ^ lenBytes
+      val n = String.size full
+      fun word i =
+        let fun b kk = Word64.fromInt (Char.ord (String.sub full (i + kk)))
+        in Word64.orb
+             (Word64.orb (Word64.<< (b 0) 24) (Word64.<< (b 1) 16))
+             (Word64.orb (Word64.<< (b 2) 8) (b 3))
+        end
+      fun loop i acc = if i >= n then List.rev acc else loop (i + 4) (word i :: acc)
+    in
+      loop 0 []
+    end
+
+  fun chunk16 ws =
+    case ws of
+        [] => []
+      | _ =>
+          let
+            fun take j xs acc =
+              if j = 0 then (List.rev acc, xs)
+              else case xs of
+                     [] => (List.rev acc, [])
+                   | (x :: rest) => take (j - 1) rest (x :: acc)
+            val (blk, rest) = take 16 ws []
+          in blk :: chunk16 rest end
+
+  fun processBlock (st, block) =
+    case st of
+      (h0,h1,h2,h3,h4,h5,h6,h7) =>
+    let
+      val w = Array.array 64 (0w0 : Word64.word)
+      fun fillBlock x i = (Array.update w i x; i + 1)
+      val _ = List.foldl fillBlock 0 block
+      fun extend i =
+        if i >= 64 then ()
+        else
+          let
+            val w15 = Array.sub w (i-15)
+            val w2  = Array.sub w (i-2)
+            val s0 = xorb (xorb (rotr w15 7) (rotr w15 18)) (lsr w15 3)
+            val s1 = xorb (xorb (rotr w2 17) (rotr w2 19)) (lsr w2 10)
+          in
+            Array.update w i
+              (add32 (add32 (add32 (Array.sub w (i-16)) s0) (Array.sub w (i-7))) s1);
+            extend (i + 1)
+          end
+      val () = extend 16
+
+      fun round (i, a, b, c, d, e, f, g, h) =
+        if i >= 64 then (a,b,c,d,e,f,g,h)
+        else
+          let
+            val s1 = xorb (xorb (rotr e 6) (rotr e 11)) (rotr e 25)
+            val ch = xorb (andb e f) (andb (notb e) g)
+            val t1 = add32 (add32 (add32 (add32 h s1) ch) (Vector.sub k i)) (Array.sub w i)
+            val s0 = xorb (xorb (rotr a 2) (rotr a 13)) (rotr a 22)
+            val maj = xorb (xorb (andb a b) (andb a c)) (andb b c)
+            val t2 = add32 s0 maj
+          in
+            round (i + 1, add32 t1 t2, a, b, c, add32 d t1, e, f, g)
+          end
+      val (a,b,c,d,e,f,g,h) = round (0, h0,h1,h2,h3,h4,h5,h6,h7)
+    in
+      (add32 h0 a, add32 h1 b, add32 h2 c, add32 h3 d,
+       add32 h4 e, add32 h5 f, add32 h6 g, add32 h7 h)
+    end
+
+  fun digestWords msg =
+    let
+      val blocks = chunk16 (padded msg)
+      val init = (0wx6a09e667,0wxbb67ae85,0wx3c6ef372,0wxa54ff53a,
+                  0wx510e527f,0wx9b05688c,0wx1f83d9ab,0wx5be0cd19)
+    in
+      List.foldl (fn blk => fn st => processBlock (st, blk)) init blocks
+    end
+
+  fun wordBytes w =
+    String.implode
+      (List.map
+        (fn sh => Char.chr (Word64.toInt (andb (lsr w sh) 0wxFF)))
+        [24, 16, 8, 0])
+
+  fun toList (a,b,c,d,e,f,g,h) = [a,b,c,d,e,f,g,h]
+
+  fun digest msg =
+    String.concat (List.map wordBytes (toList (digestWords msg)))
+
+  fun hexDigit n =
+    if n < 10 then Char.chr (n + Char.ord #"0")
+    else Char.chr (n - 10 + Char.ord #"a")
+
+  fun hexByte w =
+    String.implode
+      [hexDigit ((Word64.toInt (lsr w 4)) mod 16),
+       hexDigit ((Word64.toInt w) mod 16)]
+
+  fun hexWord w =
+    String.concat (List.map (fn sh => hexByte (lsr w sh)) [24, 16, 8, 0])
+
+  fun hexDigest msg =
+    String.concat (List.map hexWord (toList (digestWords msg)))
+
+end
+
+(* asn1.sml -- CakeML port of sml-asn1 (X.690 DER encoder/decoder).
+
+   Canonical TLV form: identifier octet, DEFINITE length (short form < 128
+   else minimal long form), then contents.  INTEGER uses minimal
+   two's-complement octets, OBJECT IDENTIFIER combines the first two arcs
+   and base-128 encodes each subidentifier.  Decoding is strict.
+
+   Dialect-gap fixes (see asn1_PORT_NOTES.md):
+     - `datatype ... of ...` -> Haskell-style curried constructors
+     - BigInt replaced by CakeML native `int` (arbitrary precision)
+     - tupled basis calls (String.sub/substring/extract) made curried
+     - multi-clause `fun ... | ...` rewritten with `case`
+     - `SOME`/`NONE`/`valOf` -> `Some`/`None`/`Option.valOf`
+     - integer `case` patterns rewritten as `if`/`else`
+     - no signature ascription
+*)
+
+structure Asn1 = struct
+
+  datatype der =
+      Bool bool
+    | Int int
+    | Bytes string
+    | BitString string
+    | Null
+    | Oid (int list)
+    | Utf8 string
+    | PrintableString string
+    | Seq (der list)
+    | Set (der list)
+    | Context int der
+
+  exception Asn1 string
+
+  (* ---- universal tag numbers ---- *)
+  val tBool   = 0x01
+  val tInt    = 0x02
+  val tBits   = 0x03
+  val tOctet  = 0x04
+  val tNull   = 0x05
+  val tOid    = 0x06
+  val tUtf8   = 0x0C
+  val tSeq    = 0x10
+  val tSet    = 0x11
+  val tPrint  = 0x13
+
+  val constructedBit = 0x20
+  val contextClass   = 0x80
+
+  fun chr n = String.str (Char.chr n)
+  fun byteAt (s, i) = Char.ord (String.sub s i)
+
+  (* ================= ENCODE ================= *)
+
+  fun lenDigits n = if n = 0 then [] else lenDigits (n div 256) @ [n mod 256]
+
+  fun encodeLen len =
+    if len < 128 then chr len
+    else
+      let val ds = lenDigits len
+      in chr (0x80 + List.length ds) ^ String.concat (List.map chr ds) end
+
+  fun tlv (idByte, content) =
+    chr idByte ^ encodeLen (String.size content) ^ content
+
+  (* ---- INTEGER: minimal two's complement (native int) ---- *)
+
+  fun digitsLE n =
+    if n = 0 then []
+    else (n mod 256) :: digitsLE (n div 256)
+
+  fun pow2 k = if k <= 0 then 1 else 2 * pow2 (k - 1)
+
+  fun encodeIntContent n =
+    if n = 0 then chr 0
+    else if n > 0 then
+      let
+        val be = List.rev (digitsLE n)
+        val bytes = case be of
+                      (b0 :: _) => if b0 >= 0x80 then 0 :: be else be
+                    | [] => [0]
+      in String.concat (List.map chr bytes) end
+    else
+      let
+        fun findK k =
+          if n >= ~(pow2 (8 * k - 1)) then k
+          else findK (k + 1)
+        val k = findK 1
+        val twos = pow2 (8 * k) + n
+        val be = List.rev (digitsLE twos)
+        val pad = List.tabulate (k - List.length be) (fn _ => 0)
+      in String.concat (List.map chr (pad @ be)) end
+
+  (* ---- OBJECT IDENTIFIER ---- *)
+
+  fun base128 v =
+    let
+      fun groupsLE n = if n < 128 then [n] else (n mod 128) :: groupsLE (n div 128)
+      val be = List.rev (groupsLE v)
+      val n = List.length be
+      fun mark (i, xs) =
+        case xs of
+          [] => []
+        | (x :: rest) => (if i < n - 1 then x + 0x80 else x) :: mark (i + 1, rest)
+    in mark (0, be) end
+
+  fun encodeOidContent arcs =
+    case arcs of
+      (a0 :: a1 :: rest) =>
+        if a0 < 0 orelse a0 > 2 then raise Asn1 "OID: first arc must be 0, 1 or 2"
+        else if a1 < 0 then raise Asn1 "OID: negative arc"
+        else if a0 < 2 andalso a1 >= 40 then raise Asn1 "OID: second arc out of range"
+        else if List.exists (fn x => x < 0) rest then raise Asn1 "OID: negative arc"
+        else
+          let val subs = (40 * a0 + a1) :: rest
+          in String.concat (List.map chr (List.concat (List.map base128 subs))) end
+    | _ => raise Asn1 "OID: needs at least two arcs"
+
+  fun encode der =
+    case der of
+      Bool b => tlv (tBool, if b then chr 0xFF else chr 0x00)
+    | Int n => tlv (tInt, encodeIntContent n)
+    | Bytes s => tlv (tOctet, s)
+    | BitString s => tlv (tBits, chr 0 ^ s)
+    | Null => tlv (tNull, "")
+    | Oid arcs => tlv (tOid, encodeOidContent arcs)
+    | Utf8 s => tlv (tUtf8, s)
+    | PrintableString s => tlv (tPrint, s)
+    | Seq ds => tlv (tSeq + constructedBit, String.concat (List.map encode ds))
+    | Set ds => tlv (tSet + constructedBit, String.concat (List.map encode ds))
+    | Context n d =>
+        if n < 0 orelse n > 30 then raise Asn1 "Context: tag out of range (0..30)"
+        else tlv (contextClass + constructedBit + n, encode d)
+
+  (* ================= DECODE ================= *)
+
+  fun readLen (s, pos) =
+    let
+      val size = String.size s
+      val () = if pos >= size then raise Asn1 "truncated length" else ()
+      val b0 = byteAt (s, pos)
+    in
+      if b0 < 0x80 then (b0, pos + 1)
+      else
+        let val n = b0 - 0x80
+        in
+          if n = 0 then raise Asn1 "indefinite length not allowed in DER"
+          else if pos + n >= size then raise Asn1 "truncated long-form length"
+          else if byteAt (s, pos + 1) = 0 then raise Asn1 "non-minimal length (leading zero)"
+          else
+            let
+              fun loop (i, acc) =
+                if i = n then acc else loop (i + 1, acc * 256 + byteAt (s, pos + 1 + i))
+              val len = loop (0, 0)
+            in
+              if len < 128 then raise Asn1 "non-minimal length (should be short form)"
+              else (len, pos + 1 + n)
+            end
+        end
+    end
+
+  fun decodeIntContent s =
+    let
+      val len = String.size s
+      val () = if len = 0 then raise Asn1 "empty INTEGER" else ()
+      val b0 = byteAt (s, 0)
+      val () =
+        if len > 1 then
+          let val b1 = byteAt (s, 1)
+          in
+            if (b0 = 0x00 andalso b1 < 0x80) orelse (b0 = 0xFF andalso b1 >= 0x80)
+            then raise Asn1 "non-minimal INTEGER" else ()
+          end
+        else ()
+      fun fold (i, acc) =
+        if i = len then acc
+        else fold (i + 1, acc * 256 + byteAt (s, i))
+      val mag = fold (0, 0)
+    in
+      if b0 >= 0x80 then mag - pow2 (8 * len) else mag
+    end
+
+  fun decodeOidContent s =
+    let
+      val len = String.size s
+      val () = if len = 0 then raise Asn1 "empty OID" else ()
+      fun readSub (j, v, first) =
+        if j = len then raise Asn1 "truncated OID subidentifier"
+        else
+          let
+            val b = byteAt (s, j)
+            val () = if first andalso b = 0x80 then raise Asn1 "non-minimal OID subidentifier" else ()
+            val v2 = v * 128 + (b mod 128)
+          in
+            if b < 0x80 then (v2, j + 1) else readSub (j + 1, v2, False)
+          end
+      fun loop (i, acc) =
+        if i = len then List.rev acc
+        else let val (v, next) = readSub (i, 0, True) in loop (next, v :: acc) end
+      val subs = loop (0, [])
+    in
+      case subs of
+        (first :: rest) =>
+          let
+            val (a0, a1) =
+              if first < 40 then (0, first)
+              else if first < 80 then (1, first - 40)
+              else (2, first - 80)
+          in a0 :: a1 :: rest end
+      | [] => raise Asn1 "empty OID"
+    end
+
+  fun decodeBitString s =
+    let
+      val len = String.size s
+      val () = if len = 0 then raise Asn1 "empty BIT STRING" else ()
+      val unused = byteAt (s, 0)
+      val () = if unused > 7 then raise Asn1 "BIT STRING: bad unused-bit count" else ()
+    in
+      String.extract s 1 None
+    end
+
+  fun parseTLV (s, pos) =
+    let
+      val size = String.size s
+      val () = if pos >= size then raise Asn1 "truncated identifier" else ()
+      val id = byteAt (s, pos)
+      val cls = id div 64
+      val constructed = (id div 32) mod 2 = 1
+      val tagnum = id mod 32
+      val () = if tagnum = 31 then raise Asn1 "high-tag-number form unsupported" else ()
+      val (len, cstart) = readLen (s, pos + 1)
+      val cend = cstart + len
+      val () = if cend > size then raise Asn1 "length exceeds input" else ()
+      val content = String.substring s cstart len
+      fun prim () = if constructed then raise Asn1 "primitive type must not be constructed" else ()
+    in
+      if cls = 0 then
+        if tagnum = tBool then
+          ( prim ()
+          ; if len <> 1 then raise Asn1 "BOOLEAN length"
+            else
+              let val v = byteAt (content, 0)
+              in if v = 0x00 then (Bool False, cend)
+                 else if v = 0xFF then (Bool True, cend)
+                 else raise Asn1 "BOOLEAN value not 0x00/0xFF"
+              end )
+        else if tagnum = tInt then (prim (); (Int (decodeIntContent content), cend))
+        else if tagnum = tBits then (prim (); (BitString (decodeBitString content), cend))
+        else if tagnum = tOctet then (prim (); (Bytes content, cend))
+        else if tagnum = tNull then
+          (prim (); if len <> 0 then raise Asn1 "NULL length" else (Null, cend))
+        else if tagnum = tOid then (prim (); (Oid (decodeOidContent content), cend))
+        else if tagnum = tUtf8 then (prim (); (Utf8 content, cend))
+        else if tagnum = tPrint then (prim (); (PrintableString content, cend))
+        else if tagnum = tSeq then
+          if not constructed then raise Asn1 "SEQUENCE must be constructed"
+          else (Seq (parseMany (s, cstart, cend)), cend)
+        else if tagnum = tSet then
+          if not constructed then raise Asn1 "SET must be constructed"
+          else (Set (parseMany (s, cstart, cend)), cend)
+        else raise Asn1 "unsupported universal tag"
+      else if cls = 2 then
+        if not constructed then raise Asn1 "context tag must be constructed (explicit)"
+        else
+          let val (inner, ipos) = parseTLV (s, cstart)
+          in
+            if ipos <> cend then raise Asn1 "context content is not a single TLV"
+            else (Context tagnum inner, cend)
+          end
+      else raise Asn1 "unsupported tag class"
+    end
+  and parseMany (s, pos, stop) =
+    if pos = stop then []
+    else if pos > stop then raise Asn1 "element overruns its container"
+    else let val (d, pos2) = parseTLV (s, pos) in d :: parseMany (s, pos2, stop) end
+
+  fun decode s =
+    let val (d, pos) = parseTLV (s, 0)
+    in if pos <> String.size s then raise Asn1 "trailing bytes after value" else d end
+
+  fun decodeOpt s = Some (decode s) handle _ => None
+
+end
+
+(* pem.sml -- CakeML port of sml-pem (RFC 7468) over Base64 (RFC 4648).
+
+   Base64 (from the vendored sml-codec) is inlined here since the CakeML
+   tower has no separate base64 port; Pem builds on it.
+
+   Records are unavailable in CakeML, so the original record-based API
+   (`{label, der}`) is represented as the tuple `(label, der)`.
+
+   Dialect-gap fixes (see pem_PORT_NOTES.md):
+     - records -> tuples
+     - multi-clause `fun ... | ...` -> single clause + `case`
+     - tupled basis calls (Vector.sub/String.sub/substring) made curried
+     - `SOME`/`NONE` -> `Some`/`None`, `true`/`false` -> `True`/`False`
+     - char comparisons curried (`Char.>= c #"A"`)
+     - no signature ascription
+*)
+
+structure Base64 = struct
+  val stdAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  val urlAlpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+  fun encodeWith alpha pad s =
+    let
+      val a = Vector.fromList (String.explode alpha)
+      fun ch i = Vector.sub a i
+      val bytes = String.explode s
+      fun go cs acc =
+        case cs of
+            [] => List.rev acc
+          | [c0] =>
+              let
+                val b0 = Char.ord c0
+                val e0 = ch (b0 div 4)
+                val e1 = ch ((b0 mod 4) * 16)
+              in
+                List.rev (if pad then #"=" :: #"=" :: e1 :: e0 :: acc
+                          else e1 :: e0 :: acc)
+              end
+          | [c0, c1] =>
+              let
+                val b0 = Char.ord c0
+                val b1 = Char.ord c1
+                val e0 = ch (b0 div 4)
+                val e1 = ch ((b0 mod 4) * 16 + b1 div 16)
+                val e2 = ch ((b1 mod 16) * 4)
+              in
+                List.rev (if pad then #"=" :: e2 :: e1 :: e0 :: acc
+                          else e2 :: e1 :: e0 :: acc)
+              end
+          | c0 :: c1 :: c2 :: rest =>
+              let
+                val b0 = Char.ord c0
+                val b1 = Char.ord c1
+                val b2 = Char.ord c2
+                val e0 = ch (b0 div 4)
+                val e1 = ch ((b0 mod 4) * 16 + b1 div 16)
+                val e2 = ch ((b1 mod 16) * 4 + b2 div 64)
+                val e3 = ch (b2 mod 64)
+              in
+                go rest (e3 :: e2 :: e1 :: e0 :: acc)
+              end
+    in
+      String.implode (go bytes [])
+    end
+
+  fun encode s = encodeWith stdAlpha True s
+  fun encodeUrl s = encodeWith urlAlpha False s
+
+  fun deval c =
+    if Char.>= c #"A" andalso Char.<= c #"Z" then Some (Char.ord c - Char.ord #"A")
+    else if Char.>= c #"a" andalso Char.<= c #"z" then Some (Char.ord c - Char.ord #"a" + 26)
+    else if Char.>= c #"0" andalso Char.<= c #"9" then Some (Char.ord c - Char.ord #"0" + 52)
+    else if Char.= c #"+" orelse Char.= c #"-" then Some 62
+    else if Char.= c #"/" orelse Char.= c #"_" then Some 63
+    else None
+
+  fun decode s =
+    let
+      val raw = List.filter (fn c => not (Char.= c #"=")) (String.explode s)
+      fun collect cs acc =
+        case cs of
+            [] => Some (List.rev acc)
+          | c :: rest =>
+              (case deval c of Some v => collect rest (v :: acc) | None => None)
+    in
+      case collect raw [] of
+          None => None
+        | Some vals =>
+            let
+              fun go vs acc =
+                case vs of
+                    [] => Some (List.rev acc)
+                  | [_] => None
+                  | [v0, v1] =>
+                      let val b0 = v0 * 4 + v1 div 16
+                      in Some (List.rev (Char.chr b0 :: acc)) end
+                  | [v0, v1, v2] =>
+                      let
+                        val b0 = v0 * 4 + v1 div 16
+                        val b1 = (v1 mod 16) * 16 + v2 div 4
+                      in Some (List.rev (Char.chr b1 :: Char.chr b0 :: acc)) end
+                  | v0 :: v1 :: v2 :: v3 :: rest =>
+                      let
+                        val b0 = v0 * 4 + v1 div 16
+                        val b1 = (v1 mod 16) * 16 + v2 div 4
+                        val b2 = (v2 mod 4) * 64 + v3
+                      in go rest (Char.chr b2 :: Char.chr b1 :: Char.chr b0 :: acc) end
+            in
+              case go vals [] of
+                  Some cs => Some (String.implode cs)
+                | None => None
+            end
+    end
+end
+
+structure Pem = struct
+  exception Pem string
+
+  val beginPre = "-----BEGIN "
+  val endPre   = "-----END "
+  val suffix   = "-----"
+  val newline  = "\n"
+
+  (* Split a Base64 string into chunks of at most 64 columns. *)
+  fun chunk64 s =
+    let
+      val n = String.size s
+      fun go i acc =
+        if i >= n then List.rev acc
+        else
+          let val len = if n - i < 64 then n - i else 64
+          in go (i + len) (String.substring s i len :: acc) end
+    in
+      go 0 []
+    end
+
+  (* (label, der) -> PEM text *)
+  fun encode (label, der) =
+    let
+      val body = chunk64 (Base64.encode der)
+      val lines =
+        (beginPre ^ label ^ suffix) :: body @ [endPre ^ label ^ suffix]
+    in
+      String.concat (List.map (fn l => l ^ newline) lines)
+    end
+
+  fun boundaryLabel pre line =
+    let
+      val plen = String.size pre
+      val slen = String.size suffix
+    in
+      if String.size line >= plen + slen
+         andalso String.isPrefix pre line
+         andalso String.isSuffix suffix line
+      then Some (String.substring line plen (String.size line - plen - slen))
+      else None
+    end
+
+  fun beginLabel l = boundaryLabel beginPre l
+  fun endLabel l = boundaryLabel endPre l
+
+  fun stripCR l =
+    let val n = String.size l in
+      if n > 0 andalso Char.= (String.sub l (n - 1)) #"\r"
+      then String.substring l 0 (n - 1)
+      else l
+    end
+
+  fun decode input =
+    let
+      val lines = List.map stripCR (String.fields (fn c => Char.= c #"\n") input)
+
+      fun finishBlock label body =
+        case Base64.decode (String.concat (List.rev body)) of
+            Some der => (label, der)
+          | None => raise Pem ("invalid Base64 body in block " ^ label)
+
+      (* Inside a block: accumulate body lines until the matching END. *)
+      fun collect label body ls =
+        case ls of
+            [] => raise Pem ("BEGIN " ^ label ^ " without matching END")
+          | (l :: rest) =>
+              (case endLabel l of
+                   Some other =>
+                     if other = label
+                     then finishBlock label body :: scan rest
+                     else raise Pem ("END label mismatch: BEGIN " ^ label ^
+                                     " vs END " ^ other)
+                 | None =>
+                     (case beginLabel l of
+                          Some _ => raise Pem ("nested BEGIN inside block " ^ label)
+                        | None => collect label (l :: body) rest))
+
+      (* Outside any block: skip explanatory text until the next BEGIN. *)
+      and scan ls =
+        case ls of
+            [] => []
+          | (l :: rest) =>
+              (case beginLabel l of
+                   Some label => collect label [] rest
+                 | None => scan rest)
+    in
+      scan lines
+    end
+end
+
+(* rsa.sml -- CakeML port of sml-rsa (RFC 8017 / PKCS#1 v2.2).
+
+   RSA primitives (RSAEP/RSADP via CRT), the padding layers
+   (EMSA-PKCS1-v1_5, EMSA-PSS, EME-OAEP, EME-PKCS1-v1_5), I2OSP/OS2IP,
+   MGF1, modular inverse, and the PKCS#1 / SPKI / PKCS#8 key codecs built
+   on the vendored Asn1/Pem.  Hashes come from the vendored Sha256.
+
+   The original carries every integer in the vendored arbitrary-precision
+   BigInt.  CakeML's native `int` is already arbitrary precision (see the
+   asn1 port, which made the same choice), so this port uses native `int`
+   throughout and interoperates directly with the native-int Asn1.Int.
+
+   Dialect-gap fixes (see rsa_PORT_NOTES.md):
+     - records `{n,e}` / `{...}` -> curried-constructor datatypes
+       (Pub, Priv) and tuple-argument functions (no `#field` selectors)
+     - BigInt replaced by native `int`; B.modpow/B.divMod/B.quotRem/...
+       -> native modpow / div / mod / arithmetic
+     - no signature ascription
+     - multi-clause `fun ... | ...` -> single clause + `case`
+     - single-arg `fn`; `SOME`/`NONE`/`true`/`false` -> Some/None/True/False
+     - tupled basis calls (String.sub/substring/extract) made curried
+     - char comparisons via Char.>=/Char.<= (no polymorphic compare)
+     - byte XOR via Word64 (CakeML `int` has no bitwise xor)
+     - Word/IntInf.* shift+mask ops -> Word64
+     - key generation (Miller-Rabin) and SHA-1/SHA-512 hashes are out of
+       scope for this port (no primality test / those hashes in the tower);
+       hashBytes implements SHA-256, the one the test vectors and the
+       X.509 chain use.
+*)
+
+structure Rsa = struct
+
+  datatype hash = SHA1 | SHA256 | SHA512
+
+  (* n e *)
+  datatype pubkey = Pub int int
+  (* n e d p q dp dq qinv *)
+  datatype privkey = Priv int int int int int int int int
+
+  exception RSA string
+
+  (* ---------------- small numeric / byte helpers ---------------- *)
+
+  fun byte n = String.str (Char.chr n)
+  fun ordOf (s, i) = Char.ord (String.sub s i)
+  fun zeros n = String.implode (List.tabulate n (fn _ => Char.chr 0))
+
+  (* non-negative remainder x mod m (m > 0): CakeML mod follows SML *)
+  fun modNN (x, m) = x mod m
+
+  (* ---- hex ---- *)
+  val hexChars = "0123456789abcdef"
+  fun toHex s =
+    String.concat
+      (List.map (fn c =>
+         let val n = Char.ord c
+         in String.implode [String.sub hexChars (n div 16), String.sub hexChars (n mod 16)] end)
+       (String.explode s))
+
+  fun isSpace c =
+    Char.= c #" " orelse Char.= c #"\n" orelse Char.= c #"\t" orelse Char.= c #"\r"
+
+  fun fromHex s =
+    let
+      fun hv c =
+        if Char.>= c #"0" andalso Char.<= c #"9" then Char.ord c - 48
+        else if Char.>= c #"a" andalso Char.<= c #"f" then Char.ord c - 87
+        else if Char.>= c #"A" andalso Char.<= c #"F" then Char.ord c - 55
+        else raise RSA "fromHex: bad digit"
+      val cs = List.filter (fn c => not (isSpace c)) (String.explode s)
+      fun loop xs =
+        case xs of
+          [] => []
+        | [_] => raise RSA "fromHex: odd length"
+        | (a :: b :: rest) => Char.chr (hv a * 16 + hv b) :: loop rest
+    in String.implode (loop cs) end
+
+  (* ---- modular exponentiation: c = b^e mod m (square-and-multiply) ---- *)
+  fun modpow (b, e, m) =
+    let
+      fun loop (base, e, acc) =
+        if e = 0 then acc
+        else
+          let val acc2 = if e mod 2 = 1 then (acc * base) mod m else acc
+          in loop ((base * base) mod m, e div 2, acc2) end
+    in loop (b mod m, e, 1) end
+
+  (* ---- I2OSP / OS2IP ---- *)
+
+  fun i2osp (x, len) =
+    if x < 0 then raise RSA "I2OSP: negative integer"
+    else
+      let
+        fun digits (x, acc) =
+          if x = 0 then acc
+          else digits (x div 256, (x mod 256) :: acc)
+        val ds = digits (x, [])
+        val l = List.length ds
+      in
+        if l > len then raise RSA "I2OSP: integer too large for the requested length"
+        else zeros (len - l) ^ String.implode (List.map Char.chr ds)
+      end
+
+  fun os2ip s =
+    let
+      val n = String.size s
+      fun loop (i, acc) =
+        if i = n then acc
+        else loop (i + 1, acc * 256 + ordOf (s, i))
+    in loop (0, 0) end
+
+  (* bit length of n >= 0 *)
+  fun bitLength n =
+    let fun loop (x, acc) = if x = 0 then acc else loop (x div 2, acc + 1)
+    in loop (n, 0) end
+
+  fun modulusBytesN n = (bitLength n + 7) div 8
+  fun modulusBytes (Pub n _) = modulusBytesN n
+  fun pubOf (Priv n e _ _ _ _ _ _) = Pub n e
+
+  (* byte-wise XOR (CakeML int has no xor; go through Word64) *)
+  fun xorByte (a, b) =
+    Word64.toInt (Word64.xorb (Word64.fromInt a) (Word64.fromInt b))
+  fun xorStr (a, b) =
+    String.implode
+      (List.tabulate (String.size a) (fn i => Char.chr (xorByte (ordOf (a, i), ordOf (b, i)))))
+
+  (* zero the leftmost [nbits] (0..7) bits of the first byte of s *)
+  fun clearTopBits (s, nbits) =
+    if nbits = 0 then s
+    else
+      let
+        val mask = Word64.toInt (Word64.>> (0wxFF : Word64.word) nbits)
+        val b0 = Word64.toInt (Word64.andb (Word64.fromInt (ordOf (s, 0))) (Word64.fromInt mask))
+      in byte b0 ^ String.extract s 1 None end
+
+  fun topBitsZero (s, nbits) =
+    nbits = 0 orelse ordOf (s, 0) = ordOf (clearTopBits (s, nbits), 0)
+
+  (* ---- hashes (SHA-256 only in the CakeML tower) ---- *)
+  fun hashBytes h m =
+    case h of
+      SHA256 => Sha256.digest m
+    | SHA1   => raise RSA "SHA-1 not available in the CakeML port"
+    | SHA512 => raise RSA "SHA-512 not available in the CakeML port"
+  fun hashLen h = case h of SHA1 => 20 | SHA256 => 32 | SHA512 => 64
+  fun hashOid h =
+    case h of
+      SHA1   => [1, 3, 14, 3, 2, 26]
+    | SHA256 => [2, 16, 840, 1, 101, 3, 4, 2, 1]
+    | SHA512 => [2, 16, 840, 1, 101, 3, 4, 2, 3]
+
+  (* MGF1 (RFC 8017 App. B.2.1) *)
+  fun mgf1 (hash, seed, len) =
+    let
+      val hLen = hashLen hash
+      fun loop (counter, acc, got) =
+        if got >= len then String.substring (String.concat (List.rev acc)) 0 len
+        else
+          let val block = hashBytes hash (seed ^ i2osp (counter, 4))
+          in loop (counter + 1, block :: acc, got + hLen) end
+    in loop (0, [], 0) end
+
+  (* ---- extended Euclid / modular inverse ---- *)
+  fun modInverse (a, m) =
+    let
+      fun ext (r0, s0, r1, s1) =
+        if r1 = 0 then (r0, s0)
+        else
+          let val q = r0 div r1
+              val r2 = r0 - q * r1
+              val s2 = s0 - q * s1
+          in ext (r1, s1, r2, s2) end
+      val (g, x) = ext (modNN (a, m), 1, m, 0)
+    in
+      if g <> 1 then raise RSA "modInverse: value is not invertible"
+      else modNN (x, m)
+    end
+
+  (* ---------------- RSA primitives ---------------- *)
+
+  fun rsaPublic (Pub n e, m) =
+    if m < 0 orelse m >= n then raise RSA "message representative out of range"
+    else modpow (m, e, n)
+
+  fun rsaPrivate (Priv n e d p q dp dq qinv, c) =
+    if c < 0 orelse c >= n then raise RSA "ciphertext representative out of range"
+    else
+      let
+        val m1 = modpow (c, dp, p)
+        val m2 = modpow (c, dq, q)
+        val h  = modNN (qinv * modNN (m1 - m2, p), p)
+      in m2 + q * h end
+
+  (* ---------------- EMSA-PKCS1-v1_5 signatures ---------------- *)
+
+  fun digestInfo (hash, msg) =
+    Asn1.encode
+      (Asn1.Seq [ Asn1.Seq [ Asn1.Oid (hashOid hash), Asn1.Null ]
+                , Asn1.Bytes (hashBytes hash msg) ])
+
+  fun emsaPkcs1v15 (hash, msg, emLen) =
+    let
+      val t = digestInfo (hash, msg)
+      val tLen = String.size t
+      val () = if emLen < tLen + 11
+               then raise RSA "intended encoded message length too short" else ()
+      val ps = String.implode (List.tabulate (emLen - tLen - 3) (fn _ => Char.chr 0xFF))
+    in byte 0 ^ byte 1 ^ ps ^ byte 0 ^ t end
+
+  fun sign (priv, hash, msg) =
+    let
+      val Priv n _ _ _ _ _ _ _ = priv
+      val k = modulusBytesN n
+      val em = emsaPkcs1v15 (hash, msg, k)
+    in i2osp (rsaPrivate (priv, os2ip em), k) end
+
+  fun verify (pub, hash, msg, sgn) =
+    (let
+       val Pub n _ = pub
+       val k = modulusBytesN n
+     in
+       String.size sgn = k
+       andalso
+       let val m = rsaPublic (pub, os2ip sgn)
+           val em = i2osp (m, k)
+       in em = emsaPkcs1v15 (hash, msg, k) end
+     end) handle _ => False
+
+  (* ---------------- EMSA-PSS signatures ---------------- *)
+
+  fun emsaPssEncode (hash, msg, salt, emBits) =
+    let
+      val hLen = hashLen hash
+      val sLen = String.size salt
+      val emLen = (emBits + 7) div 8
+      val () = if emLen < hLen + sLen + 2 then raise RSA "PSS: encoding error" else ()
+      val mHash = hashBytes hash msg
+      val mPrime = zeros 8 ^ mHash ^ salt
+      val h = hashBytes hash mPrime
+      val ps = zeros (emLen - sLen - hLen - 2)
+      val db = ps ^ byte 1 ^ salt
+      val maskedDB = xorStr (db, mgf1 (hash, h, emLen - hLen - 1))
+      val maskedDB2 = clearTopBits (maskedDB, 8 * emLen - emBits)
+    in maskedDB2 ^ h ^ byte 0xBC end
+
+  fun signPss (priv, hash, salt, msg) =
+    let
+      val Priv n _ _ _ _ _ _ _ = priv
+      val emBits = bitLength n - 1
+      val em = emsaPssEncode (hash, msg, salt, emBits)
+    in i2osp (rsaPrivate (priv, os2ip em), modulusBytesN n) end
+
+  fun verifyPss (pub, hash, saltLen, msg, sgn) =
+    (let
+       val Pub n _ = pub
+       val k = modulusBytesN n
+       val emBits = bitLength n - 1
+       val emLen = (emBits + 7) div 8
+       val hLen = hashLen hash
+     in
+       String.size sgn = k
+       andalso
+       let
+         val em = i2osp (rsaPublic (pub, os2ip sgn), emLen)
+         val dbLen = emLen - hLen - 1
+       in
+         emLen >= hLen + saltLen + 2
+         andalso ordOf (em, emLen - 1) = 0xBC
+         andalso
+         let
+           val maskedDB = String.substring em 0 dbLen
+           val h = String.substring em dbLen hLen
+           val topBits = 8 * emLen - emBits
+         in
+           topBitsZero (maskedDB, topBits)
+           andalso
+           let
+             val db = clearTopBits (xorStr (maskedDB, mgf1 (hash, h, dbLen)), topBits)
+             val psN = dbLen - saltLen - 1
+             fun zeroPrefix i = i >= psN orelse (ordOf (db, i) = 0 andalso zeroPrefix (i + 1))
+           in
+             zeroPrefix 0 andalso ordOf (db, psN) = 1
+             andalso
+             let
+               val salt = String.extract db (psN + 1) None
+               val mHash = hashBytes hash msg
+               val mPrime = zeros 8 ^ mHash ^ salt
+             in h = hashBytes hash mPrime end
+           end
+         end
+       end
+     end) handle _ => False
+
+  (* ---------------- EME-OAEP encryption ---------------- *)
+
+  fun encryptOaep (pub, hash, label, seed, msg) =
+    let
+      val Pub n _ = pub
+      val k = modulusBytesN n
+      val hLen = hashLen hash
+      val mLen = String.size msg
+      val () = if String.size seed <> hLen then raise RSA "OAEP: seed must be hLen bytes" else ()
+      val () = if mLen > k - 2 * hLen - 2 then raise RSA "OAEP: message too long" else ()
+      val lHash = hashBytes hash label
+      val db = lHash ^ zeros (k - mLen - 2 * hLen - 2) ^ byte 1 ^ msg
+      val maskedDB = xorStr (db, mgf1 (hash, seed, k - hLen - 1))
+      val maskedSeed = xorStr (seed, mgf1 (hash, maskedDB, hLen))
+      val em = byte 0 ^ maskedSeed ^ maskedDB
+    in i2osp (rsaPublic (pub, os2ip em), k) end
+
+  fun decryptOaep (priv, hash, label, ct) =
+    let
+      val Priv n _ _ _ _ _ _ _ = priv
+      val k = modulusBytesN n
+      val hLen = hashLen hash
+      val () = if String.size ct <> k orelse k < 2 * hLen + 2
+               then raise RSA "OAEP: decryption error" else ()
+      val em = i2osp (rsaPrivate (priv, os2ip ct), k)
+      val lHash = hashBytes hash label
+      val y = ordOf (em, 0)
+      val maskedSeed = String.substring em 1 hLen
+      val maskedDB = String.substring em (1 + hLen) (k - hLen - 1)
+      val seed = xorStr (maskedSeed, mgf1 (hash, maskedDB, hLen))
+      val db = xorStr (maskedDB, mgf1 (hash, seed, k - hLen - 1))
+      val lHash2 = String.substring db 0 hLen
+      fun findOne i =
+        if i >= String.size db then raise RSA "OAEP: decryption error"
+        else
+          let val v = ordOf (db, i)
+          in if v = 1 then i
+             else if v = 0 then findOne (i + 1)
+             else raise RSA "OAEP: decryption error"
+          end
+      val sep = findOne hLen
+    in
+      if y <> 0 orelse lHash2 <> lHash then raise RSA "OAEP: decryption error"
+      else String.extract db (sep + 1) None
+    end
+
+  (* ---------------- EME-PKCS1-v1_5 encryption ---------------- *)
+
+  fun nonZeroPad (randomBytes, need) =
+    let
+      fun go (acc, n) =
+        if n = 0 then String.implode (List.rev acc)
+        else
+          let
+            val chunk = randomBytes n
+            val () = if String.size chunk = 0 then raise RSA "randomBytes returned no bytes" else ()
+            fun take (cs, acc, n) =
+              if n = 0 then (acc, 0)
+              else
+                case cs of
+                  [] => (acc, n)
+                | (c :: rest) =>
+                    if Char.= c (Char.chr 0) then take (rest, acc, n)
+                    else take (rest, c :: acc, n - 1)
+            val (acc2, n2) = take (String.explode chunk, acc, n)
+          in go (acc2, n2) end
+    in go ([], need) end
+
+  fun encrypt (pub, msg, randomBytes) =
+    let
+      val Pub n _ = pub
+      val k = modulusBytesN n
+      val mLen = String.size msg
+      val () = if mLen > k - 11 then raise RSA "message too long for PKCS#1 v1.5" else ()
+      val ps = nonZeroPad (randomBytes, k - mLen - 3)
+      val em = byte 0 ^ byte 2 ^ ps ^ byte 0 ^ msg
+    in i2osp (rsaPublic (pub, os2ip em), k) end
+
+  fun decrypt (priv, ct) =
+    let
+      val Priv n _ _ _ _ _ _ _ = priv
+      val k = modulusBytesN n
+      val () = if String.size ct <> k orelse k < 11 then raise RSA "decryption error" else ()
+      val em = i2osp (rsaPrivate (priv, os2ip ct), k)
+      val () = if ordOf (em, 0) <> 0 orelse ordOf (em, 1) <> 2 then raise RSA "decryption error" else ()
+      fun findZero i =
+        if i >= k then raise RSA "decryption error"
+        else if ordOf (em, i) = 0 then i else findZero (i + 1)
+      val z = findZero 2
+      val () = if z < 10 then raise RSA "decryption error" else ()
+    in String.extract em (z + 1) None end
+
+  (* ---------------- DER / PEM key import & export ---------------- *)
+
+  val rsaOid = [1, 2, 840, 113549, 1, 1, 1]
+  val rsaAlgId = Asn1.Seq [ Asn1.Oid rsaOid, Asn1.Null ]
+
+  fun encodePublicDer (Pub n e) =
+    Asn1.encode (Asn1.Seq [ Asn1.Int n, Asn1.Int e ])
+
+  fun decodePublicDer s =
+    case Asn1.decode s of
+      Asn1.Seq [ Asn1.Int n, Asn1.Int e ] => Pub n e
+    | _ => raise RSA "bad RSAPublicKey"
+
+  fun encodePrivateDer (Priv n e d p q dp dq qinv) =
+    Asn1.encode
+      (Asn1.Seq [ Asn1.Int 0, Asn1.Int n, Asn1.Int e, Asn1.Int d
+                , Asn1.Int p, Asn1.Int q
+                , Asn1.Int dp, Asn1.Int dq, Asn1.Int qinv ])
+
+  fun decodePrivateDer s =
+    case Asn1.decode s of
+      Asn1.Seq [ Asn1.Int _, Asn1.Int n, Asn1.Int e, Asn1.Int d
+               , Asn1.Int p, Asn1.Int q, Asn1.Int dp, Asn1.Int dq, Asn1.Int qinv ] =>
+        Priv n e d p q dp dq qinv
+    | _ => raise RSA "bad RSAPrivateKey"
+
+  fun encodeSpkiDer pub =
+    Asn1.encode (Asn1.Seq [ rsaAlgId, Asn1.BitString (encodePublicDer pub) ])
+
+  fun decodeSpkiDer s =
+    case Asn1.decode s of
+      Asn1.Seq (Asn1.Seq (Asn1.Oid oid :: _) :: Asn1.BitString bits :: _) =>
+        if oid = rsaOid then decodePublicDer bits
+        else raise RSA "SubjectPublicKeyInfo: not an RSA key"
+    | _ => raise RSA "bad SubjectPublicKeyInfo"
+
+  fun encodePkcs8Der priv =
+    Asn1.encode (Asn1.Seq [ Asn1.Int 0, rsaAlgId, Asn1.Bytes (encodePrivateDer priv) ])
+
+  fun decodePkcs8Der s =
+    case Asn1.decode s of
+      Asn1.Seq (Asn1.Int _ :: Asn1.Seq (Asn1.Oid oid :: _) :: Asn1.Bytes octets :: _) =>
+        if oid = rsaOid then decodePrivateDer octets
+        else raise RSA "PKCS#8 PrivateKeyInfo: not an RSA key"
+    | _ => raise RSA "bad PKCS#8 PrivateKeyInfo"
+
+  fun encodePublicPem pub = Pem.encode ("PUBLIC KEY", encodeSpkiDer pub)
+  fun encodePrivatePem priv = Pem.encode ("PRIVATE KEY", encodePkcs8Der priv)
+
+  fun firstBlock s =
+    case Pem.decode s of
+      [] => raise RSA "no PEM block found"
+    | (b :: _) => b
+
+  fun decodePublicPem s =
+    let val (label, der) = firstBlock s
+    in
+      if label = "PUBLIC KEY" then decodeSpkiDer der
+      else if label = "RSA PUBLIC KEY" then decodePublicDer der
+      else raise RSA ("unexpected PEM label for a public key: " ^ label)
+    end
+
+  fun decodePrivatePem s =
+    let val (label, der) = firstBlock s
+    in
+      if label = "PRIVATE KEY" then decodePkcs8Der der
+      else if label = "RSA PRIVATE KEY" then decodePrivateDer der
+      else raise RSA ("unexpected PEM label for a private key: " ^ label)
+    end
+
+end
+
+(* x509.sml -- CakeML port of sml-x509 (RFC 5280 certificate parsing +
+   RSA signature verification).
+
+   A small offset-aware DER reader (not the strict Asn1 common-subset
+   decoder) hands back the verbatim byte-slice of every element via `raw`,
+   so signatures over the original tbsCertificate bytes verify exactly, and
+   so real-world types outside the common subset (UTCTime/GeneralizedTime,
+   IA5String, IMPLICIT primitive context tags) parse.  Pem unwraps
+   CERTIFICATE blocks; Rsa does the PKCS#1 v1.5 / PSS verification.
+
+   Like the rest of the CakeML tower this uses native `int` (the serial
+   number too -- CakeML `int` is arbitrary precision).
+
+   Dialect-gap fixes (see x509_PORT_NOTES.md):
+     - records are a *parse error* in cake: the `node`, `time`, `cert`
+       records and the `{hash,saltLen}`/`{ca,pathLen}`/attribute/extension
+       records all became datatypes / tuples; every `#field` selector became
+       a constructor accessor or a tuple destructure.
+     - record-argument functions (verifySignature {cert,issuer}, verifyChain
+       {...}) became tuple-argument functions.
+     - BigInt -> native `int`; multi-clause `fun ... | ...` -> `case`;
+       SOME/NONE/true/false -> Some/None/True/False; tupled basis calls
+       curried; char compares via Char.*; Word.* bit ops -> Word64.*;
+       no signature ascription.
+*)
+
+structure X509 = struct
+
+  exception X509 string
+
+  (* ===================== parsed types ===================== *)
+
+  (* year month day hour minute second *)
+  datatype time = Time int int int int int int
+
+  (* (oid, value) *)
+  type attribute = int list * string
+  type name = attribute list
+
+  (* (oid, critical, value) *)
+  type extension = int list * bool * string
+
+  datatype sigAlg =
+      Sha1WithRsa | Sha256WithRsa | Sha384WithRsa | Sha512WithRsa
+    | RsaPss Rsa.hash int                    (* hash, saltLen *)
+    | EcdsaWithSha256 | EcdsaWithSha384 | EcdsaWithSha512
+    | Ed25519Sig | UnknownSigAlg (int list)
+
+  datatype keyAlg =
+      RsaKey | EcKey (int list) | Ed25519Key | UnknownKeyAlg (int list)
+
+  datatype verifyResult = Verified | Failed | Unsupported string
+  datatype chainResult = ChainOk | ChainError string
+
+  (* der tbsDer version serialContent serial sigAlg issuer issuerDer
+     subject subjectDer validity spkiDer keyAlg signatureValue extensions
+     where validity = (notBefore, notAfter) *)
+  datatype cert =
+    Cert string string int string int sigAlg
+         name string name string (time * time) string
+         keyAlg string (extension list)
+
+  (* ===================== DER reader ===================== *)
+
+  fun byteAt (s, i) = Char.ord (String.sub s i)
+
+  (* cls constructed tag start contentOff contentLen endOff *)
+  datatype node = Node int bool int int int int int
+  fun nCls   (Node c _ _ _ _ _ _) = c
+  fun nCon   (Node _ k _ _ _ _ _) = k
+  fun nTag   (Node _ _ t _ _ _ _) = t
+  fun nStart (Node _ _ _ s _ _ _) = s
+  fun nCOff  (Node _ _ _ _ co _ _) = co
+  fun nCLen  (Node _ _ _ _ _ l _) = l
+  fun nEnd   (Node _ _ _ _ _ _ e) = e
+
+  fun readLen (s, pos) =
+    let val size = String.size s
+        val () = if pos >= size then raise X509 "truncated length" else ()
+        val b0 = byteAt (s, pos)
+    in
+      if b0 < 0x80 then (b0, pos + 1)
+      else
+        let val n = b0 - 0x80
+            val () = if n = 0 then raise X509 "indefinite length not allowed" else ()
+            val () = if pos + n >= size then raise X509 "truncated long-form length" else ()
+            fun loop (i, acc) =
+              if i = n then acc else loop (i + 1, acc * 256 + byteAt (s, pos + 1 + i))
+        in (loop (0, 0), pos + 1 + n) end
+    end
+
+  fun readTLV (s, pos) =
+    let
+      val size = String.size s
+      val () = if pos >= size then raise X509 "truncated identifier" else ()
+      val id = byteAt (s, pos)
+      val cls = id div 64
+      val constructed = (id div 32) mod 2 = 1
+      val low = id mod 32
+      val (tag, idEnd) =
+        if low <> 31 then (low, pos + 1)
+        else
+          let fun loop (i, acc) =
+                let val () = if i >= size then raise X509 "truncated high tag" else ()
+                    val b = byteAt (s, i)
+                    val acc2 = acc * 128 + (b mod 128)
+                in if b < 0x80 then (acc2, i + 1) else loop (i + 1, acc2) end
+          in loop (pos + 1, 0) end
+      val (len, contentOff) = readLen (s, idEnd)
+      val endOff = contentOff + len
+      val () = if endOff > size then raise X509 "length exceeds input" else ()
+    in Node cls constructed tag pos contentOff len endOff end
+
+  fun content (s, n) = String.substring s (nCOff n) (nCLen n)
+  fun raw (s, n) = String.substring s (nStart n) (nEnd n - nStart n)
+
+  fun children (s, n) =
+    let val stop = nEnd n
+        fun loop pos =
+          if pos >= stop then []
+          else let val c = readTLV (s, pos) in c :: loop (nEnd c) end
+    in loop (nCOff n) end
+
+  (* ---- small primitive decoders over a node ---- *)
+
+  fun uintOf (s, n) =
+    let val c = content (s, n)
+        fun loop (i, acc) =
+          if i >= String.size c then acc
+          else loop (i + 1, acc * 256 + Char.ord (String.sub c i))
+    in loop (0, 0) end
+
+  fun boolOf (s, n) =
+    String.size (content (s, n)) > 0 andalso byteAt (content (s, n), 0) <> 0
+
+  fun oidOf (s, n) =
+    let
+      val c = content (s, n)
+      val len = String.size c
+      val () = if len = 0 then raise X509 "empty OID" else ()
+      fun readSub (j, v) =
+        if j >= len then raise X509 "truncated OID"
+        else let val b = byteAt (c, j)
+                 val v2 = v * 128 + (b mod 128)
+             in if b < 0x80 then (v2, j + 1) else readSub (j + 1, v2) end
+      fun loop (i, acc) =
+        if i >= len then List.rev acc
+        else let val (v, nx) = readSub (i, 0) in loop (nx, v :: acc) end
+      val subs = loop (0, [])
+    in
+      case subs of
+        (first :: rest) =>
+          let val (a0, a1) =
+                if first < 40 then (0, first)
+                else if first < 80 then (1, first - 40)
+                else (2, first - 80)
+          in a0 :: a1 :: rest end
+      | [] => raise X509 "empty OID"
+    end
+
+  fun bitStringOf (s, n) =
+    let val c = content (s, n)
+    in if String.size c = 0 then "" else String.extract c 1 None end
+
+  fun bigUnsigned bytes =
+    let fun loop (i, acc) =
+          if i >= String.size bytes then acc
+          else loop (i + 1, acc * 256 + byteAt (bytes, i))
+    in loop (0, 0) end
+
+  fun toHexLower s =
+    let val d = "0123456789abcdef"
+        fun hx c = let val x = Char.ord c
+                   in String.implode [String.sub d (x div 16), String.sub d (x mod 16)] end
+    in String.concat (List.map hx (String.explode s)) end
+
+  (* ===================== OID tables ===================== *)
+
+  val oidCommonName     = [2,5,4,3]
+  val oidBasicConstr    = [2,5,29,19]
+  val oidKeyUsage       = [2,5,29,15]
+  val oidExtKeyUsage    = [2,5,29,37]
+  val oidSubjectAltName = [2,5,29,17]
+  val oidSubjectKeyId   = [2,5,29,14]
+  val oidAuthKeyId      = [2,5,29,35]
+
+  fun hashOfOid oid =
+    if oid = [1,3,14,3,2,26] then Some Rsa.SHA1
+    else if oid = [2,16,840,1,101,3,4,2,1] then Some Rsa.SHA256
+    else if oid = [2,16,840,1,101,3,4,2,3] then Some Rsa.SHA512
+    else None
+
+  (* ===================== field parsers ===================== *)
+
+  fun parseName (s, nameNode) =
+    let
+      val rdns = children (s, nameNode)
+      fun fromAtv atvNode =
+        case children (s, atvNode) of
+          (oidN :: valN :: _) => (oidOf (s, oidN), content (s, valN))
+        | _ => raise X509 "malformed AttributeTypeAndValue"
+      fun fromSet setNode = List.map fromAtv (children (s, setNode))
+    in List.concat (List.map fromSet rdns) end
+
+  fun parseTime (s, tNode) =
+    let
+      val c = content (s, tNode)
+      fun d2 i = (byteAt (c, i) - 48) * 10 + (byteAt (c, i + 1) - 48)
+    in
+      if nTag tNode = 23 then
+        let val yy = d2 0
+            val year = if yy < 50 then 2000 + yy else 1900 + yy
+        in Time year (d2 2) (d2 4) (d2 6) (d2 8) (d2 10) end
+      else if nTag tNode = 24 then
+        Time (d2 0 * 100 + d2 2) (d2 4) (d2 6) (d2 8) (d2 10) (d2 12)
+      else raise X509 "unexpected time type"
+    end
+
+  fun parseValidity (s, vNode) =
+    case children (s, vNode) of
+      (nb :: na :: _) => (parseTime (s, nb), parseTime (s, na))
+    | _ => raise X509 "malformed Validity"
+
+  (* RSASSA-PSS-params (RFC 4055): returns (hash, saltLen) *)
+  fun parsePssParams (s, paramsNode) =
+    let
+      val kids = children (s, paramsNode)
+      fun scan (xs, hash, salt) =
+        case xs of
+          [] => (hash, salt)
+        | (k :: rest) =>
+            if nCls k = 2 andalso nTag k = 0 then
+              (case children (s, k) of
+                 (alg :: _) =>
+                   (case children (s, alg) of
+                      (oidN :: _) =>
+                        (case hashOfOid (oidOf (s, oidN)) of
+                           Some h => scan (rest, h, salt)
+                         | None => scan (rest, hash, salt))
+                    | _ => scan (rest, hash, salt))
+               | _ => scan (rest, hash, salt))
+            else if nCls k = 2 andalso nTag k = 2 then
+              (case children (s, k) of
+                 (intN :: _) => scan (rest, hash, uintOf (s, intN))
+               | _ => scan (rest, hash, salt))
+            else scan (rest, hash, salt)
+    in scan (kids, Rsa.SHA1, 20) end
+
+  fun parseSigAlg (s, algNode) =
+    case children (s, algNode) of
+      (oidN :: rest) =>
+        let val oid = oidOf (s, oidN)
+        in
+          if oid = [1,2,840,113549,1,1,5] then Sha1WithRsa
+          else if oid = [1,2,840,113549,1,1,11] then Sha256WithRsa
+          else if oid = [1,2,840,113549,1,1,12] then Sha384WithRsa
+          else if oid = [1,2,840,113549,1,1,13] then Sha512WithRsa
+          else if oid = [1,2,840,113549,1,1,10] then
+            (case rest of
+               (p :: _) => let val (h, sl) = parsePssParams (s, p) in RsaPss h sl end
+             | [] => RsaPss Rsa.SHA1 20)
+          else if oid = [1,2,840,10045,4,3,2] then EcdsaWithSha256
+          else if oid = [1,2,840,10045,4,3,3] then EcdsaWithSha384
+          else if oid = [1,2,840,10045,4,3,4] then EcdsaWithSha512
+          else if oid = [1,3,101,112] then Ed25519Sig
+          else UnknownSigAlg oid
+        end
+    | _ => raise X509 "malformed AlgorithmIdentifier"
+
+  fun parseKeyAlg (s, spkiNode) =
+    case children (s, spkiNode) of
+      (algN :: _) =>
+        (case children (s, algN) of
+           (oidN :: rest) =>
+             let val oid = oidOf (s, oidN)
+             in
+               if oid = [1,2,840,113549,1,1,1] then RsaKey
+               else if oid = [1,2,840,10045,2,1] then
+                 (case rest of
+                    (p :: _) => (EcKey (oidOf (s, p)) handle _ => EcKey [])
+                  | [] => EcKey [])
+               else if oid = [1,3,101,112] then Ed25519Key
+               else UnknownKeyAlg oid
+             end
+         | _ => raise X509 "malformed SPKI algorithm")
+    | _ => raise X509 "malformed SubjectPublicKeyInfo"
+
+  fun parseExtensions (s, extsSeqNode) =
+    let
+      fun fromExt extNode =
+        case children (s, extNode) of
+          (oidN :: rest) =>
+            let
+              val oid = oidOf (s, oidN)
+              val (critical, valNode) =
+                case rest of
+                  (b :: v :: _) =>
+                    if nTag b = 1 andalso nCls b = 0 then (boolOf (s, b), v) else (False, b)
+                | (v :: _) => (False, v)
+                | [] => raise X509 "extension missing value"
+            in (oid, critical, content (s, valNode)) end
+        | _ => raise X509 "malformed Extension"
+    in List.map fromExt (children (s, extsSeqNode)) end
+
+  (* ===================== top-level parse ===================== *)
+
+  fun parse der =
+    let
+      val certN = readTLV (der, 0)
+      val () = if nEnd certN <> String.size der then raise X509 "trailing bytes" else ()
+      val (tbsN, algN, sigN) =
+        case children (der, certN) of
+          (a :: b :: c :: _) => (a, b, c)
+        | _ => raise X509 "Certificate is not a 3-element SEQUENCE"
+
+      val tbsDer = raw (der, tbsN)
+      val sa = parseSigAlg (der, algN)
+      val sigValue = bitStringOf (der, sigN)
+
+      val tbsKids = children (der, tbsN)
+      val (ver, afterVer) =
+        case tbsKids of
+          (k :: ks) =>
+            if nCls k = 2 andalso nTag k = 0 then
+              (case children (der, k) of
+                 (vN :: _) => (uintOf (der, vN), ks)
+               | [] => (0, ks))
+            else (0, tbsKids)
+        | [] => raise X509 "empty tbsCertificate"
+
+      val (serialN, issuerN, validN, subjectN, spkiN, moreKids) =
+        case afterVer of
+          (serialN :: sigInnerN :: issuerN :: validN :: subjectN :: spkiN :: more) =>
+            (serialN, issuerN, validN, subjectN, spkiN, more)
+        | _ => raise X509 "tbsCertificate missing required fields"
+
+      val serialContent = content (der, serialN)
+      val serialMag =
+        if String.size serialContent > 1 andalso byteAt (serialContent, 0) = 0
+        then String.extract serialContent 1 None else serialContent
+
+      val exts =
+        case List.find (fn k => nCls k = 2 andalso nTag k = 3) moreKids of
+          Some ext3 =>
+            (case children (der, ext3) of
+               (seqN :: _) => parseExtensions (der, seqN)
+             | [] => [])
+        | None => []
+    in
+      Cert der tbsDer ver serialContent (bigUnsigned serialMag) sa
+           (parseName (der, issuerN)) (raw (der, issuerN))
+           (parseName (der, subjectN)) (raw (der, subjectN))
+           (parseValidity (der, validN)) (raw (der, spkiN))
+           (parseKeyAlg (der, spkiN)) sigValue exts
+    end
+
+  fun parsePem pem =
+    let val blocks = Pem.decode pem
+        val certs = List.filter (fn b => let val (label, _) = b in label = "CERTIFICATE" end) blocks
+    in List.map (fn b => let val (_, d) = b in parse d end) certs end
+
+  (* ===================== accessors ===================== *)
+
+  fun cDer        (Cert x _ _ _ _ _ _ _ _ _ _ _ _ _ _) = x
+  fun tbsCertificateDer (Cert _ x _ _ _ _ _ _ _ _ _ _ _ _ _) = x
+  fun version     (Cert _ _ x _ _ _ _ _ _ _ _ _ _ _ _) = x
+  fun cSerialCont (Cert _ _ _ x _ _ _ _ _ _ _ _ _ _ _) = x
+  fun serialNumber(Cert _ _ _ _ x _ _ _ _ _ _ _ _ _ _) = x
+  fun signatureAlg(Cert _ _ _ _ _ x _ _ _ _ _ _ _ _ _) = x
+  fun issuer      (Cert _ _ _ _ _ _ x _ _ _ _ _ _ _ _) = x
+  fun cIssuerDer  (Cert _ _ _ _ _ _ _ x _ _ _ _ _ _ _) = x
+  fun subject     (Cert _ _ _ _ _ _ _ _ x _ _ _ _ _ _) = x
+  fun cSubjectDer (Cert _ _ _ _ _ _ _ _ _ x _ _ _ _ _) = x
+  fun validity    (Cert _ _ _ _ _ _ _ _ _ _ x _ _ _ _) = x
+  fun subjectPublicKeyInfoDer (Cert _ _ _ _ _ _ _ _ _ _ _ x _ _ _) = x
+  fun publicKeyAlg(Cert _ _ _ _ _ _ _ _ _ _ _ _ x _ _) = x
+  fun signatureValue (Cert _ _ _ _ _ _ _ _ _ _ _ _ _ x _) = x
+  fun extensions  (Cert _ _ _ _ _ _ _ _ _ _ _ _ _ _ x) = x
+
+  fun notBefore c = let val (nb, _) = validity c in nb end
+  fun notAfter  c = let val (_, na) = validity c in na end
+
+  fun serialHex c =
+    let val m = cSerialCont c
+        val m2 = if String.size m > 1 andalso byteAt (m, 0) = 0
+                 then String.extract m 1 None else m
+    in toHexLower m2 end
+
+  (* ===================== time ===================== *)
+
+  fun compareTime (a, b) =
+    let
+      val Time ya moa da ha mia sa = a
+      val Time yb mob db hb mib sb = b
+      fun chain (ord, k) = case ord of Equal => k () | _ => ord
+    in
+      chain (Int.compare ya yb, fn () =>
+      chain (Int.compare moa mob, fn () =>
+      chain (Int.compare da db, fn () =>
+      chain (Int.compare ha hb, fn () =>
+      chain (Int.compare mia mib, fn () =>
+             Int.compare sa sb)))))
+    end
+
+  fun pad2 n = (if n < 10 then "0" else "") ^ Int.toString n
+  fun pad4 n = (if n < 1000 then "0" else "") ^ (if n < 100 then "0" else "")
+               ^ (if n < 10 then "0" else "") ^ Int.toString n
+  fun timeToString t =
+    let val Time y mo da h mi s = t
+    in pad4 y ^ "-" ^ pad2 mo ^ "-" ^ pad2 da ^ "T"
+       ^ pad2 h ^ ":" ^ pad2 mi ^ ":" ^ pad2 s ^ "Z" end
+
+  (* ===================== names ===================== *)
+
+  fun commonName n =
+    case List.find (fn a => let val (oid, _) = a in oid = oidCommonName end) n of
+      Some a => let val (_, v) = a in Some v end
+    | None => None
+
+  fun shortOid oid =
+    if oid = [2,5,4,3] then "CN"
+    else if oid = [2,5,4,10] then "O"
+    else if oid = [2,5,4,11] then "OU"
+    else if oid = [2,5,4,6] then "C"
+    else if oid = [2,5,4,7] then "L"
+    else if oid = [2,5,4,8] then "ST"
+    else if oid = [1,2,840,113549,1,9,1] then "emailAddress"
+    else String.concatWith "." (List.map Int.toString oid)
+
+  fun nameToString n =
+    String.concatWith ","
+      (List.map (fn a => let val (oid, value) = a in shortOid oid ^ "=" ^ value end)
+                (List.rev n))
+
+  (* ===================== extension-derived accessors ===================== *)
+
+  fun findExtension c oid =
+    List.find (fn e => let val (eo, _, _) = e in eo = oid end) (extensions c)
+
+  fun rsaPublicKey c =
+    case publicKeyAlg c of
+      RsaKey => (Some (Rsa.decodeSpkiDer (subjectPublicKeyInfoDer c)) handle _ => None)
+    | _ => None
+
+  fun basicConstraints c =
+    case findExtension c oidBasicConstr of
+      None => None
+    | Some e =>
+        (let val (_, _, v) = e
+             val seqN = readTLV (v, 0)
+             val kids = children (v, seqN)
+             val ca = case kids of
+                        (b :: _) => if nTag b = 1 then boolOf (v, b) else False
+                      | [] => False
+             val pathLen =
+               case List.find (fn k => nTag k = 2 andalso nCls k = 0) kids of
+                 Some iN => Some (uintOf (v, iN))
+               | None => None
+         in Some (ca, pathLen) end) handle _ => None
+
+  fun isCA c =
+    case basicConstraints c of Some bc => let val (ca, _) = bc in ca end | None => False
+
+  fun keyUsage c =
+    case findExtension c oidKeyUsage of
+      None => []
+    | Some e =>
+        (let
+          val (_, _, v) = e
+          val bsN = readTLV (v, 0)
+          val bits = content (v, bsN)
+          val names = [ "digitalSignature", "nonRepudiation", "keyEncipherment"
+                      , "dataEncipherment", "keyAgreement", "keyCertSign"
+                      , "cRLSign", "encipherOnly", "decipherOnly" ]
+          fun bitSet i =
+            let val byteIdx = 1 + (i div 8)
+            in byteIdx < String.size bits
+               andalso (byteAt (bits, byteIdx)
+                        div (Word64.toInt (Word64.<< (0w1 : Word64.word) (7 - (i mod 8))))) mod 2 = 1
+            end
+          fun pick (i, xs) =
+            case xs of
+              [] => []
+            | (nm :: rest) => (if bitSet i then [nm] else []) @ pick (i + 1, rest)
+        in pick (0, names) end) handle _ => []
+
+  fun extKeyUsage c =
+    case findExtension c oidExtKeyUsage of
+      None => []
+    | Some e =>
+        (let
+          val (_, _, v) = e
+          val seqN = readTLV (v, 0)
+          fun nameOf oid =
+            if oid = [1,3,6,1,5,5,7,3,1] then "serverAuth"
+            else if oid = [1,3,6,1,5,5,7,3,2] then "clientAuth"
+            else if oid = [1,3,6,1,5,5,7,3,3] then "codeSigning"
+            else if oid = [1,3,6,1,5,5,7,3,4] then "emailProtection"
+            else if oid = [1,3,6,1,5,5,7,3,8] then "timeStamping"
+            else if oid = [1,3,6,1,5,5,7,3,9] then "OCSPSigning"
+            else String.concatWith "." (List.map Int.toString oid)
+        in List.map (fn k => nameOf (oidOf (v, k))) (children (v, seqN)) end) handle _ => []
+
+  fun dnsNames c =
+    case findExtension c oidSubjectAltName of
+      None => []
+    | Some e =>
+        (let val (_, _, v) = e
+             val seqN = readTLV (v, 0)
+         in List.map (fn k => content (v, k))
+              (List.filter (fn k => nCls k = 2 andalso nTag k = 2) (children (v, seqN)))
+         end) handle _ => []
+
+  fun subjectKeyId c =
+    case findExtension c oidSubjectKeyId of
+      None => None
+    | Some e => let val (_, _, v) = e
+                in (Some (content (v, readTLV (v, 0))) handle _ => None) end
+
+  fun authorityKeyId c =
+    case findExtension c oidAuthKeyId of
+      None => None
+    | Some e =>
+        (let val (_, _, v) = e
+             val seqN = readTLV (v, 0)
+         in case List.find (fn k => nCls k = 2 andalso nTag k = 0) (children (v, seqN)) of
+              Some k => Some (content (v, k))
+            | None => None
+         end) handle _ => None
+
+  (* ===================== verification ===================== *)
+
+  fun verifySignature (cert, issuer) =
+    case rsaPublicKey issuer of
+      None => Unsupported "issuer key is not RSA"
+    | Some pub =>
+        let
+          val msg = tbsCertificateDer cert
+          val sgn = signatureValue cert
+          fun pkcs1 h = (if Rsa.verify (pub, h, msg, sgn) then Verified else Failed) handle _ => Failed
+        in
+          case signatureAlg cert of
+            Sha1WithRsa   => pkcs1 Rsa.SHA1
+          | Sha256WithRsa => pkcs1 Rsa.SHA256
+          | Sha512WithRsa => pkcs1 Rsa.SHA512
+          | Sha384WithRsa => Unsupported "SHA-384 not supported by sml-rsa"
+          | RsaPss h sl =>
+              ((if Rsa.verifyPss (pub, h, sl, msg, sgn) then Verified else Failed) handle _ => Failed)
+          | EcdsaWithSha256 => Unsupported "ECDSA verification is out of scope"
+          | EcdsaWithSha384 => Unsupported "ECDSA verification is out of scope"
+          | EcdsaWithSha512 => Unsupported "ECDSA verification is out of scope"
+          | Ed25519Sig      => Unsupported "Ed25519 verification is out of scope"
+          | UnknownSigAlg _ => Unsupported "unknown signature algorithm"
+        end
+
+  fun verifySelfSigned c = verifySignature (c, c)
+
+  (* ===================== path validation ===================== *)
+
+  fun verifyChain (cert, intermediates, roots, time) =
+    let
+      fun timeOk c =
+        let val (nb, na) = validity c
+        in compareTime (nb, time) <> Greater andalso compareTime (time, na) <> Greater end
+
+      fun isTrustedRoot c = List.exists (fn r => cDer r = cDer c) roots
+      fun verOk (c, iss) = verifySignature (c, iss) = Verified
+
+      fun loop (c, fuel) =
+        if fuel <= 0 then ChainError "chain too long (possible loop)"
+        else if not (timeOk c) then ChainError "certificate outside its validity window"
+        else if cIssuerDer c = cSubjectDer c andalso isTrustedRoot c then
+          (if verifySelfSigned c = Verified then ChainOk
+           else ChainError "trusted root self-signature does not verify")
+        else
+          case List.find (fn r => cSubjectDer r = cIssuerDer c) roots of
+            Some r =>
+              if not (isCA r) then ChainError "issuer is not a CA"
+              else if not (timeOk r) then ChainError "issuer outside its validity window"
+              else if verOk (c, r) then ChainOk
+              else ChainError "signature does not verify against trusted root"
+          | None =>
+              (case List.find (fn i => cSubjectDer i = cIssuerDer c) intermediates of
+                 Some i =>
+                   if not (isCA i) then ChainError "intermediate is not a CA"
+                   else if not (verOk (c, i)) then
+                     ChainError "signature does not verify against intermediate"
+                   else loop (i, fuel - 1)
+               | None => ChainError "no issuer certificate found")
+    in
+      loop (cert, List.length intermediates + List.length roots + 2)
+    end
+
+end
+
+
+(* ===================== driver ===================== *)
+
+val failures = Ref 0
+
+fun check (name, got, expected) =
+  if String.= got expected then print ("PASS " ^ name ^ "\n")
+  else
+    ( failures := !failures + 1
+    ; print ("FAIL " ^ name ^ "\n  expected: " ^ expected ^ "\n  got:      " ^ got ^ "\n") )
+
+fun checkBool (name, got) =
+  if got then print ("PASS " ^ name ^ "\n")
+  else ( failures := !failures + 1 ; print ("FAIL " ^ name ^ " (expected true)\n") )
+
+fun vstr v =
+  case v of
+    X509.Verified => "Verified"
+  | X509.Failed => "Failed"
+  | X509.Unsupported s => "Unsupported:" ^ s
+
+fun cstr r =
+  case r of X509.ChainOk => "ChainOk" | X509.ChainError s => "ChainError:" ^ s
+
+val leafDer = Rsa.fromHex "308203b9308202a1a00302010202144843455d9e6c5c3ccad4f5c7fc27c596e2071ba8300d06092a864886f70d01010b0500304b310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c65733125302306035504030c1c736d6c2d746c73205465737420496e7465726d656469617465204341301e170d3236303632323138343030335a170d3238303932343138343030335a303e310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c65733118301606035504030c0f7777772e6578616d706c652e636f6d30820122300d06092a864886f70d01010105000382010f003082010a0282010100af100463c8b96589b43721cc823e1a620b7da232df8942193e9b26fa7ed61a32f8123c64712f416e8539bd138ec4b67430e6d7bb0e59b3bb3269b151b3ac5937327c4c3d2d517aec674b45e1df082a8cfdcd9676bf92c5f425ec59869676b52bbd215912278bc8671b4402774420205a92ef96fc66ca3a7f2d2b57ec1199cf56e7424a54a4b89cef286a6f5c770433383c457620f35bf7547d54a38b5760107a7b2392156369225ff43712661fa4d0d13546556bf9a181655bec255916654f7d3e983e540a134f47e19fa45e6f2fad9301dd9fdac9a6f5778883caf791811c8b9d3f93c39e25bd3ac8828db16cde79839bed307aadec021afd0bee0c608ddbe10203010001a381a130819e300c0603551d130101ff04023000300e0603551d0f0101ff0404030205a030130603551d25040c300a06082b0601050507030130290603551d1104223020820f7777772e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d301d0603551d0e0416041421112b96b32cc0ba0d8b1eba0efc38e06a3f036f301f0603551d230418301680148f777977f1ae989fa798062246fd399232d74cd7300d06092a864886f70d01010b050003820101008eba80749840da77cbecede3420ad335cc6cbd8f43935dd846761a1adc4b29db666418a04023f8900a5eac407ade00251dba6a09d30c29b95e3e83ce1db9de6a4c432d6538c8912e9ee82adadf32ae6e9eb092846aacf2a97d45adb56bb146f38b5db6be48c77cde30940693e2dd6c29f5fa5cbd0f7c32ecb5a3bc97b95173944e34f4c383e68c5bee345ba159c86d3b64b868898662c3bfcabcbf03e604073e806d87b8ef85835754e5729706abc7aa0b6207862cc1b8fcba769e5e474fb066a7096bd7e9a80c875b49268213c08b20ed1c0a5df4b00efcd215c712fa620795a5bb00292990d66ff4d07c92b9bfb6202eb9e64b66d8408dc783a096e2d9482b"
+val intDer  = Rsa.fromHex "308203823082026aa00302010202146b0c23fbde8fb956d0bbef901f413fae69fe6644300d06092a864886f70d01010b05003043310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c6573311d301b06035504030c14736d6c2d746c73205465737420526f6f74204341301e170d3236303632323138343030335a170d3336303631393138343030335a304b310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c65733125302306035504030c1c736d6c2d746c73205465737420496e7465726d65646961746520434130820122300d06092a864886f70d01010105000382010f003082010a0282010100a7c41f143e107aaa27c308d36ea78df97207e6fccf23be5e6123f8eb3ad23b89a26378f0d61243879cd095a8d1a0c95058d6df7661834406b0f3e0b8e01b68ff873da35c2cc6bd8fb414238f922698e5642b585cc5ac2f04f0c6a266c1f581d025c2bc8ae26c58baa1b1e069f445799f506a0f4301c4588fd5d990b37adafaad50c764db93819df1306e71d07089a1407c26996f30c761d4e7c9960a83d2c4198d77d1e5b3781ded96719166daeb52e9cf3aafaeef97f1ecd1ae27c2a689fbc7a19be0ce71c41834fa1de7370be3fc489a4c6024ee626ca38a50cd48dcca9d6599015f03937d1a80f1c2169025be0c6e4de444afe426847853f66386339987b90203010001a366306430120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e041604148f777977f1ae989fa798062246fd399232d74cd7301f0603551d2304183016801488334a40a2f087cd16044805c1281012a33503a7300d06092a864886f70d01010b050003820101003a55facf6eefe76d1f0b23dbf6bdc53218d6e28b32f549b27283a52b7cde1e561916390da7decdfeb35ade1accfad9f8a823ceeaba8b9df46c7a4206832e5f4752558496510f910a4f51fb3cdd4a8dee3095f32baa5a5e4de54155ee924508a4204e68b85e8bee0aa0fbb4ee075770b955cd999a09366a635a5c554048b98d9e70879e0c8a1768f4b941d00e2fb3367fb2cd0694dab50d8b30b9e8ca6364f479adb621df6c0f5cb76d1d3d07e85599bee71517ebc58a9193b94acbca6b10840630fca6811a19c0a5cee1b71062ce6022be5820c5badde8c0bbdf8700a34d705643b384e464d83e18ba8ed3671406b9719a93081a995518b86958611b3c0342cb"
+val rootDer = Rsa.fromHex "308203773082025fa00302010202146fff8a9c0312e59dbd6ba4d460da9bef8bc5d186300d06092a864886f70d01010b05003043310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c6573311d301b06035504030c14736d6c2d746c73205465737420526f6f74204341301e170d3236303632323138343030335a170d3436303631373138343030335a3043310b300906035504061302555331153013060355040a0c0c736a7174656e7461636c6573311d301b06035504030c14736d6c2d746c73205465737420526f6f7420434130820122300d06092a864886f70d01010105000382010f003082010a0282010100a87a1e173896374c51a9012098c524b0c8dffa1372428e5672b35833d2fae03d2864105b1de41a3bee206b93c2ee898016114780bb256d43f03d2ed5827cda9edf445f3e47ecc7aa1c5649a0c49d72c4c90e015053bffd454fd06113f8358d5b629f5ef6c5047613a47ed375224ce0ffa58f10d92b3f93dd0e56b23d413ef47f610f7bc4075be4f05b1f0d5b4ffa624aa31390218eb787f40faf0fd1fb7aaa238b7b3c8fe184f61eedbd4081d58c220123b22188bcff5517ee2f04c3fb93487ff2b7ebb0709c2f11254b2e39074d6eca7e3a7bd24d87c1241c962f8c769697e013974666f39516ad3a52a1ef609e0a4eac73d46b9daf854777a4fbe465fc99750203010001a3633061301d0603551d0e0416041488334a40a2f087cd16044805c1281012a33503a7301f0603551d2304183016801488334a40a2f087cd16044805c1281012a33503a7300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300d06092a864886f70d01010b050003820101001a935c45202308eee9d8bcaebdd721fd00e71c73cab7058c60fac6aa89b7cd4c9080f64376b611b73480b6f19d5e818c1e458667fd76d0b3afc79a829438803640345a73a1d263a1295cb7d648df80edf651bb5683f05d5398f0f583751a7d7b464c8fdc1d366960a759620a8b8c2f4f95003d1b107d7c7a4309d32289d884a4d54cb8876875f4253dc3b26978e4989a82dbb7510437141cb9cc4b6428976be0bed1bfe0487031e425c7fae57acee80335f9009cf1415444347e53b6a681faada6be1313afe5408d45de69c697df0e820c7b51942086fe63c64f25c9a4f9c53aa225696924107e9794133662b5af3aee3d31c8b2ad9f99513046cbdf1b92290a"
+
+val leaf = X509.parse leafDer
+val intr = X509.parse intDer
+val root = X509.parse rootDer
+
+(* ---- leaf field extraction (cross-checked vs MLton sml-x509) ---- *)
+val _ = check ("leaf subject CN",
+               (case X509.commonName (X509.subject leaf) of Some s => s | None => "<none>"),
+               "www.example.com")
+val _ = check ("leaf subject (DN)", X509.nameToString (X509.subject leaf), "CN=www.example.com,O=sjqtentacles,C=US")
+val _ = check ("leaf issuer (DN)", X509.nameToString (X509.issuer leaf), "CN=sml-tls Test Intermediate CA,O=sjqtentacles,C=US")
+val _ = check ("leaf notBefore", X509.timeToString (X509.notBefore leaf), "2026-06-22T18:40:03Z")
+val _ = check ("leaf notAfter", X509.timeToString (X509.notAfter leaf), "2028-09-24T18:40:03Z")
+val _ = check ("leaf serialHex", X509.serialHex leaf, "4843455d9e6c5c3ccad4f5c7fc27c596e2071ba8")
+val _ =
+  case X509.rsaPublicKey leaf of
+    Some (Rsa.Pub n e) =>
+      ( check ("leaf pubkey n", Int.toString n, "22099601718909564146045214054420316927008651295336392846718734552481070804629995042678225959238589592917480443234272818723763018735587566995822422346072513306460705457065614771617962329581047707691846397534219232567959633825263067359930230273508445969701913850436586659540586000994918487690719856710400547045195098361273615838356490044561792308523246673255814376244301238135802518410962166608398098903780636140440624981260397266541674983285198488932145706805076058421405735719504092483769937644705698565528142005096554249278456400864382220303580674019977008088029597534917024981323163855236888376224789127624924191713")
+      ; check ("leaf pubkey e", Int.toString e, "65537") )
+  | None => check ("leaf pubkey", "<none>", "rsa")
+
+(* ---- signature verification against the issuer ---- *)
+val _ = check ("leaf verify against intermediate",
+               vstr (X509.verifySignature (leaf, intr)), "Verified")
+val _ = checkBool ("leaf verify rejects wrong issuer (root)",
+                   X509.verifySignature (leaf, root) <> X509.Verified)
+
+(* ---- intermediate ---- *)
+val _ = check ("intermediate subject CN",
+               (case X509.commonName (X509.subject intr) of Some s => s | None => "<none>"),
+               "sml-tls Test Intermediate CA")
+val _ = checkBool ("intermediate isCA", X509.isCA intr)
+val _ = check ("intermediate verify against root",
+               vstr (X509.verifySignature (intr, root)), "Verified")
+
+(* ---- root (self-signed) ---- *)
+val _ = check ("root subject CN",
+               (case X509.commonName (X509.subject root) of Some s => s | None => "<none>"),
+               "sml-tls Test Root CA")
+val _ = check ("root verify self-signed", vstr (X509.verifySelfSigned root), "Verified")
+
+(* ---- full chain leaf -> intermediate -> root ---- *)
+val now = X509.Time 2027 6 1 12 0 0
+val _ = check ("verifyChain leaf->int->root",
+               cstr (X509.verifyChain (leaf, [intr], [root], now)), "ChainOk")
+
+(* a tampered leaf signature must not verify *)
+val badLeafDer =
+  let val n = String.size leafDer
+      val last = Char.ord (String.sub leafDer (n - 1))
+      val flipped = Char.chr (Word64.toInt (Word64.xorb (Word64.fromInt last) 0wxFF))
+  in String.substring leafDer 0 (n - 1) ^ String.str flipped end
+val badLeaf = X509.parse badLeafDer
+val _ = checkBool ("tampered leaf signature rejected",
+                   X509.verifySignature (badLeaf, intr) <> X509.Verified)
+
+val _ =
+  if !failures = 0 then print "ALL PASS\n"
+  else print (Int.toString (!failures) ^ " FAILURES\n")
