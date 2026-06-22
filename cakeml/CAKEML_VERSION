@@ -1,0 +1,7 @@
+CakeML v3400 (prebuilt bootstrapped compiler, cake-arm8-64.tar.gz)
+- GitHub release: https://github.com/CakeML/cakeml/releases/tag/v3400
+- Release date: 2026-06-19
+- Repo commit at spike time: e0e4e28e48d2d8c593c9404ee5ad141ba414a837 (2026-06-21)
+- Binary used: cake-arm8-64 (ARM64, native on Apple Silicon)
+- Compiler target flag for spike binaries: --target=arm8
+- Built compiler verified via hello.cml end-to-end before porting.

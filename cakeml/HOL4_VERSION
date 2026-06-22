@@ -1,0 +1,14 @@
+HOL4 "Trindemossen 2"
+- Repo: https://github.com/HOL-Theorem-Prover/HOL
+- Commit at spike time: b3aa119cceaeed18a4de28fab271e33945fbdd9c (2026-06-22)
+- Built at: /Users/asarkisyan/Documents/HOL (bin/Holmake, bin/hol)
+- Smoke-tested: `hol` REPL starts and prints "HOL4 OK".
+- Not required for the SHA-256 spike itself: the spike used the
+  prebuilt bootstrapped CakeML compiler (see CAKEML_VERSION), which
+  does not require a live HOL4 build. HOL4 is required for the later
+  refinement-proof phase (J4) and for rebuilding the CakeML compiler
+  from source.
+- A full `Holmake` of the CakeML tree from HOL4 was started and
+  confirmed to progress past theory compilation (~20 hour build);
+  it was stopped once the prebuilt compiler proved sufficient for the
+  spike. See SPIKE_REPORT.md.

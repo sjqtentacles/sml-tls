@@ -1,36 +1,23 @@
 (* sha256_test.cml — test harness for the CakeML SHA-256 port.
 
-   Builds a standalone CakeML program that:
-   - computes SHA-256 of "", "abc", and a long message
-   - prints the hex digests
-   - prints PASS/FAIL against the known vectors
-
-   Compile from the directory containing this file + sha256.sml via:
-       cake --target=arm8 <sha256_test.cml >sha256_test.cake.S
-       cc sha256_test.cake.S basis_ffi.c -lm -o sha256_test.cake
-   (or use the Makefile pattern from the CakeML release.)
-
-   Note: CakeML has no `use` / top-level include for multiple source files in
-   the simple compiler invocation, so we inline the structure here. The
-   canonical ported source remains sha256.sml; this file is the
-   self-contained build artifact for the spike. *)
+   Self-contained build artifact for the spike: the structure is inlined
+   because the simple `cake` invocation compiles a single source file.
+   The canonical ported source is sha256.sml; this file mirrors it. *)
 
 structure Sha256 = struct
 
   val mask32 : Word64.word = 0wxFFFFFFFF
-  infix 6 ++
-  fun op ++ (a, b) = Word64.andb (Word64.+ (a, b), mask32)
-  val andb = Word64.andb
-  val orb  = Word64.orb
-  val xorb = Word64.xorb
-  infix andb orb xorb
-  fun << (a, b) = Word64.andb (Word64.<< (a, b), mask32)
-  fun >> (a, b) = Word64.>> (a, b)
-  infix << >>
-  fun notb w = Word64.xorb (w, mask32)
 
-  fun rotr (w, n : int) =
-    Word64.orb (Word64.>> (w, n), Word64.andb (Word64.<< (w, 64 - n), mask32))
+  fun add32 a b = Word64.andb (Word64.+ a b) mask32
+  fun andb a b = Word64.andb a b
+  fun orb  a b = Word64.orb a b
+  fun xorb a b = Word64.xorb a b
+  fun lsl32 a b = Word64.andb (Word64.<< a b) mask32
+  fun lsr a b = Word64.>> a b
+  fun notb w = Word64.xorb w mask32
+
+  fun rotr w n =
+    Word64.orb (Word64.>> w n) (Word64.andb (Word64.<< w (32 - n)) mask32)
 
   val k : Word64.word Vector.vector = Vector.fromList
     [0wx428a2f98,0wx71374491,0wxb5c0fbcf,0wxe9b5dba5,0wx3956c25b,0wx59f111f1,
@@ -45,7 +32,17 @@ structure Sha256 = struct
      0wx5b9cca4f,0wx682e6ff3,0wx748f82ee,0wx78a5636f,0wx84c87814,0wx8cc70208,
      0wx90befffa,0wxa4506ceb,0wxbef9a3f7,0wxc67178f2]
 
-  fun padded (msg : string) : Word64.word list =
+  fun shiftFactor i =
+    if i = 0 then 1
+    else if i = 1 then 256
+    else if i = 2 then 65536
+    else if i = 3 then 16777216
+    else if i = 4 then 4294967296
+    else if i = 5 then 1099511627776
+    else if i = 6 then 281474976710656
+    else 72057594037927936
+
+  fun padded (msg : string) =
     let
       val len = String.size msg
       val bitLen = len * 8
@@ -53,20 +50,18 @@ structure Sha256 = struct
       val padZeros : int =
         let val m = String.size withOne mod 64
         in if m <= 56 then 56 - m else 120 - m end
-      val zeros = String.implode (List.tabulate (padZeros, fn _ => Char.chr 0))
-      fun lenByte (i : int) =
-        Char.chr (((bitLen >> (i * 8)) mod 256))
+      val zeros = String.implode (List.tabulate padZeros (fn _ => Char.chr 0))
+      fun lenByte i = Char.chr ((bitLen div shiftFactor i) mod 256)
       val lenBytes = String.implode (List.map lenByte [7,6,5,4,3,2,1,0])
       val full = withOne ^ zeros ^ lenBytes
       val n = String.size full
-      fun word (i : int) =
-        let fun b (kk : int) =
-              Word64.fromInt (Char.ord (String.sub (full, i + kk)))
-        in Word64.orb (Word64.orb (Word64.<< (b 0, 24), Word64.<< (b 1, 16)),
-                       Word64.orb (Word64.<< (b 2, 8), b 3))
+      fun word i =
+        let fun b kk = Word64.fromInt (Char.ord (String.sub full (i + kk)))
+        in Word64.orb
+             (Word64.orb (Word64.<< (b 0) 24) (Word64.<< (b 1) 16))
+             (Word64.orb (Word64.<< (b 2) 8) (b 3))
         end
-      fun loop (i : int) acc =
-        if i >= n then List.rev acc else loop (i + 4) (word i :: acc)
+      fun loop i acc = if i >= n then List.rev acc else loop (i + 4) (word i :: acc)
     in
       loop 0 []
     end
@@ -76,47 +71,53 @@ structure Sha256 = struct
         [] => []
       | _ =>
           let
-            fun take 0 xs acc = (List.rev acc, xs)
-              | take (j : int) (x :: xs) acc = take (j - 1) xs (x :: acc)
-              | take _ [] acc = (List.rev acc, [])
+            fun take j xs acc =
+              if j = 0 then (List.rev acc, xs)
+              else case xs of
+                     [] => (List.rev acc, [])
+                   | (x :: rest) => take (j - 1) rest (x :: acc)
             val (blk, rest) = take 16 ws []
           in blk :: chunk16 rest end
 
-  fun processBlock ((h0,h1,h2,h3,h4,h5,h6,h7), block) =
+  fun processBlock (st, block) =
+    case st of
+      (h0,h1,h2,h3,h4,h5,h6,h7) =>
     let
-      val w = Array.array (64, 0w0 : Word64.word)
-      val _ = List.foldl (fn (x, i) => (Array.update (w, i, x); i + 1)) 0 block
-      fun extend (i : int) =
+      val w = Array.array 64 (0w0 : Word64.word)
+      fun fillBlock x i = (Array.update w i x; i + 1)
+      val _ = List.foldl fillBlock 0 block
+      fun extend i =
         if i >= 64 then ()
         else
           let
-            val w15 = Array.sub (w, i-15)
-            val w2  = Array.sub (w, i-2)
-            val s0 = xorb (xorb (rotr (w15, 7), rotr (w15, 18)), >> (w15, 3))
-            val s1 = xorb (xorb (rotr (w2, 17), rotr (w2, 19)), >> (w2, 10))
+            val w15 = Array.sub w (i-15)
+            val w2  = Array.sub w (i-2)
+            val s0 = xorb (xorb (rotr w15 7) (rotr w15 18)) (lsr w15 3)
+            val s1 = xorb (xorb (rotr w2 17) (rotr w2 19)) (lsr w2 10)
           in
-            Array.update (w, i,
-              Array.sub (w, i-16) ++ s0 ++ Array.sub (w, i-7) ++ s1);
+            Array.update w i
+              (add32 (add32 (add32 (Array.sub w (i-16)) s0) (Array.sub w (i-7))) s1);
             extend (i + 1)
           end
       val () = extend 16
 
-      fun round (i : int, a, b, c, d, e, f, g, h) =
+      fun round (i, a, b, c, d, e, f, g, h) =
         if i >= 64 then (a,b,c,d,e,f,g,h)
         else
           let
-            val s1 = xorb (xorb (rotr (e, 6), rotr (e, 11)), rotr (e, 25))
-            val ch = xorb (andb (e, f), andb (notb e, g))
-            val t1 = h ++ s1 ++ ch ++ Vector.sub (k, i) ++ Array.sub (w, i)
-            val s0 = xorb (xorb (rotr (a, 2), rotr (a, 13)), rotr (a, 22))
-            val maj = xorb (xorb (andb (a, b), andb (a, c)), andb (b, c))
-            val t2 = s0 ++ maj
+            val s1 = xorb (xorb (rotr e 6) (rotr e 11)) (rotr e 25)
+            val ch = xorb (andb e f) (andb (notb e) g)
+            val t1 = add32 (add32 (add32 (add32 h s1) ch) (Vector.sub k i)) (Array.sub w i)
+            val s0 = xorb (xorb (rotr a 2) (rotr a 13)) (rotr a 22)
+            val maj = xorb (xorb (andb a b) (andb a c)) (andb b c)
+            val t2 = add32 s0 maj
           in
-            round (i + 1, t1 ++ t2, a, b, c, d ++ t1, e, f, g)
+            round (i + 1, add32 t1 t2, a, b, c, add32 d t1, e, f, g)
           end
       val (a,b,c,d,e,f,g,h) = round (0, h0,h1,h2,h3,h4,h5,h6,h7)
     in
-      (h0 ++ a, h1 ++ b, h2 ++ c, h3 ++ d, h4 ++ e, h5 ++ f, h6 ++ g, h7 ++ h)
+      (add32 h0 a, add32 h1 b, add32 h2 c, add32 h3 d,
+       add32 h4 e, add32 h5 f, add32 h6 g, add32 h7 h)
     end
 
   fun digestWords msg =
@@ -125,14 +126,13 @@ structure Sha256 = struct
       val init = (0wx6a09e667,0wxbb67ae85,0wx3c6ef372,0wxa54ff53a,
                   0wx510e527f,0wx9b05688c,0wx1f83d9ab,0wx5be0cd19)
     in
-      List.foldl (fn (blk, st) => processBlock (st, blk)) init blocks
+      List.foldl (fn blk => fn st => processBlock (st, blk)) init blocks
     end
 
   fun wordBytes w =
     String.implode
       (List.map
-        (fn (sh : int) =>
-           Char.chr (Word64.toInt (andb (>> (w, sh), 0wxFF))))
+        (fn sh => Char.chr (Word64.toInt (andb (lsr w sh) 0wxFF)))
         [24, 16, 8, 0])
 
   fun toList (a,b,c,d,e,f,g,h) = [a,b,c,d,e,f,g,h]
@@ -146,31 +146,28 @@ structure Sha256 = struct
 
   fun hexByte w =
     String.implode
-      [hexDigit (Word64.toInt (>> (w, 4)) mod 16),
-       hexDigit (Word64.toInt w mod 16)]
+      [hexDigit ((Word64.toInt (lsr w 4)) mod 16),
+       hexDigit ((Word64.toInt w) mod 16)]
 
   fun hexWord w =
-    String.concat (List.map (fn sh => hexByte (>> (w, sh))) [24, 16, 8, 0])
+    String.concat (List.map (fn sh => hexByte (lsr w sh)) [24, 16, 8, 0])
 
   fun hexDigest msg =
     String.concat (List.map hexWord (toList (digestWords msg)))
 
 end
 
-(* Test vectors *)
 val v_empty = ""
 val v_empty_expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 val v_abc = "abc"
 val v_abc_expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
-(* Long message: "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
-   (56 chars -> exactly 2 blocks after padding). *)
 val v_long = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
 val v_long_expected = "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
 
 fun check (name, got, expected) =
-  if String.= (got, expected) then
+  if String.= got expected then
     print ("PASS " ^ name ^ "\n" ^ got ^ "\n")
   else
     print ("FAIL " ^ name ^ "\n  expected: " ^ expected ^ "\n  got:      " ^ got ^ "\n");
