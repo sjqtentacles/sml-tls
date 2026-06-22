@@ -364,7 +364,7 @@ sig
   val certificateVerifyPrefix : string
 
   (* Build the message that CertificateVerify signs / verifies:
-       64 spaces ^ contextString ^ single space ^ transcriptHash
+       64 spaces ^ contextString ^ single 0x00 octet ^ transcriptHash
      `contextString` is "TLS 1.3, client CertificateVerify" or
      "TLS 1.3, server CertificateVerify". *)
   val certificateVerifyInput : {contextString : string, transcriptHash : string} -> string
@@ -372,6 +372,22 @@ sig
   (* The two context strings. *)
   val clientCertVerifyContext : string  (* "TLS 1.3, client CertificateVerify" *)
   val serverCertVerifyContext : string  (* "TLS 1.3, server CertificateVerify" *)
+
+  (* Sign / verify a server CertificateVerify (RFC 8446 §4.4.3).
+     `transcript` is the raw concatenated handshake-message bytes through the
+     server Certificate message; it is hashed (SHA-256) internally and the
+     resulting digest is wrapped by `certificateVerifyInput`.
+
+     Only the rsa_pss_rsae_sha256 scheme (0x0804) is supported: SHA-256,
+     RSA-PSS with a 32-byte salt. `signServerCertVerify` uses a fixed
+     all-zero 32-byte salt for determinism, and raises `Fail` for any other
+     `sigAlg`. `verifyServerCertVerify` returns `false` for an unsupported
+     `sigAlg` or a bad signature. *)
+  val signServerCertVerify :
+    {priv : Rsa.privkey, sigAlg : Word16.word, transcript : string} -> string
+  val verifyServerCertVerify :
+    {pub : Rsa.pubkey, sigAlg : Word16.word, transcript : string,
+     sgn : string} -> bool
 
   (* Compute the Finished verify_data:
        HMAC(finishedKey, Hash(transcript))
@@ -461,6 +477,10 @@ sig
   val clientAppKey : clientState -> (string * string) option
   val transcript : clientState -> string
   val isConnected : clientState -> bool
+  (* True once the server's CertificateVerify signature has been verified
+     against the leaf certificate's public key. Remains false for legacy
+     empty-signature handshakes where CV verification is skipped. *)
+  val certVerified : clientState -> bool
   (* The fatal alert description byte that terminated the connection, if any. *)
   val error : clientState -> Word8.word option
 end

@@ -65,6 +65,20 @@ struct
       let val () = print ("  FAIL - " ^ name ^ ": " ^ toHex expected ^ " <> " ^ toHex actual ^ "\n")
       in check name false end
 
+  (* Read a binary fixture file (relative to the repo root, where the test
+     binary runs) as a raw byte string. Works under MLton and Poly/ML. *)
+  fun readBin path =
+    let
+      val ins = BinIO.openIn path
+      val content = BinIO.inputAll ins
+      val () = BinIO.closeIn ins
+    in
+      Byte.bytesToString content
+    end
+
+  (* Compare two BigInts (RSA moduli/exponents are not an eqtype). *)
+  fun bigEq (a, b) = BigInt.compare (a, b) = EQUAL
+
   (* =================================================================== *)
   (* RFC 8448 key-schedule vectors                                        *)
   (* =================================================================== *)
@@ -154,6 +168,75 @@ struct
         TlsKeySchedule.masterSecret {handshakeSecret = handshakeSecret}
       val () = checkBytes ("master_secret = HKDF-Extract(derived(handshake), 0)",
                            expectedMasterSecret, masterSecret)
+
+      (* ---- CertificateVerify signed content (RFC 8446 sec. 4.4.3) ---- *)
+      val () = section "key schedule: CertificateVerify signed content"
+      val cvTh = String.implode (List.tabulate (32, fn i => Char.chr i))
+      val cvInput = TlsKeySchedule.certificateVerifyInput
+                      {contextString = TlsKeySchedule.serverCertVerifyContext,
+                       transcriptHash = cvTh}
+      (* 64 octets of 0x20, the context string, a single 0x00, then the hash. *)
+      val cvExpect = String.implode (List.tabulate (64, fn _ => #" "))
+                     ^ TlsKeySchedule.serverCertVerifyContext
+                     ^ String.str (Char.chr 0)
+                     ^ cvTh
+      val () = checkBytes ("CV signed content uses a single 0x00 separator",
+                           cvExpect, cvInput)
+
+      (* ---- CertificateVerify RSA-PSS sign/verify roundtrip (real sig) ----
+         Uses the committed deterministic fixture (cv-key.pkcs8.der +
+         cv-leaf.der): the server signs with the private key, the client
+         verifies with the public key extracted from the leaf certificate. *)
+      val () = section "CertificateVerify: RSA-PSS sign/verify roundtrip"
+      val cvKeyDer  = readBin "test/fixtures/certs/cv-key.pkcs8.der"
+      val cvLeafDer = readBin "test/fixtures/certs/cv-leaf.der"
+      val cvPriv    = Rsa.decodePkcs8Der cvKeyDer
+      val cvCert    = X509.parse cvLeafDer
+      val cvPubFromCert = Option.valOf (X509.rsaPublicKey cvCert)
+      (* The fixtures must be a matching (key, cert) pair. *)
+      val () = checkBool ("CV fixture key matches cert pubkey")
+        (true, bigEq (#n (Rsa.pubOf cvPriv), #n cvPubFromCert)
+               andalso bigEq (#e (Rsa.pubOf cvPriv), #e cvPubFromCert))
+
+      val cvTranscript = "ClientHello..EncryptedExtensions..Certificate (test)"
+      val cvTH         = Sha256.digest cvTranscript
+      val cvSignInput  = TlsKeySchedule.certificateVerifyInput
+        {contextString = TlsKeySchedule.serverCertVerifyContext,
+         transcriptHash = cvTH}
+      val cvSalt = String.implode (List.tabulate (32, fn _ => Char.chr 0))
+      val cvSig  = Rsa.signPss
+        {priv = cvPriv, hash = Rsa.SHA256, salt = cvSalt, msg = cvSignInput}
+      val () = checkBool ("CV signature verifies with cert pubkey")
+        (true, Rsa.verifyPss {pub = cvPubFromCert, hash = Rsa.SHA256,
+                              saltLen = 32, msg = cvSignInput, sgn = cvSig})
+
+      (* Tampered signature must NOT verify. *)
+      val cvSigBad =
+        let val n = String.size cvSig
+            val last = Char.ord (String.sub (cvSig, n - 1))
+            val flipped = Char.chr (Word8.toInt
+              (Word8.xorb (Word8.fromInt last, 0w1)))
+        in String.substring (cvSig, 0, n - 1) ^ String.str flipped end
+      val () = checkBool ("tampered CV signature fails")
+        (false, Rsa.verifyPss {pub = cvPubFromCert, hash = Rsa.SHA256,
+                               saltLen = 32, msg = cvSignInput, sgn = cvSigBad})
+
+      (* Now via the higher-level TlsKeySchedule helpers (sigAlg 0x0804). *)
+      val cvSig2 = TlsKeySchedule.signServerCertVerify
+        {priv = cvPriv, sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+         transcript = cvTranscript}
+      val () = checkBool ("signServerCertVerify output verifies")
+        (true, TlsKeySchedule.verifyServerCertVerify
+          {pub = cvPubFromCert, sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+           transcript = cvTranscript, sgn = cvSig2})
+      val () = checkBool ("verifyServerCertVerify rejects wrong transcript")
+        (false, TlsKeySchedule.verifyServerCertVerify
+          {pub = cvPubFromCert, sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+           transcript = cvTranscript ^ "x", sgn = cvSig2})
+      val () = checkBool ("verifyServerCertVerify rejects unsupported sigAlg")
+        (false, TlsKeySchedule.verifyServerCertVerify
+          {pub = cvPubFromCert, sigAlg = 0wx0806,
+           transcript = cvTranscript, sgn = cvSig2})
 
       (* ---- Record layer round-trip ---- *)
       val () = section "record layer: TLSPlaintext round-trip"
@@ -595,6 +678,97 @@ struct
         (true, Option.isSome (TlsClient.error tcstErr))
       val () = checkBool ("bad chain -> client not connected")
         (true, not (TlsClient.isConnected tcstErr))
+
+      (* =============================================================== *)
+      (* CertificateVerify end-to-end: server signs, client verifies      *)
+      (* =============================================================== *)
+      val () = section "J1: CertificateVerify real RSA-PSS (end-to-end)"
+
+      (* Client offers rsa_pss_rsae_sha256 (0x0804) and an empty trust store
+         (so chain validation is skipped and we exercise CV alone). *)
+      val cvClientCfg = {
+        x25519PrivateKey = clientPriv, p256PrivateKey = NONE,
+        clientRandom = clientRandom, legacySessionId = "",
+        cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
+        extensions = [], serverName = "example.test",
+        trustStore = [], now = 0,
+        sigAlgs = [TlsHandshake.sigRsaPssRsaSha256]
+      } : TlsClient.clientConfig
+
+      (* Server signs its CV with the fixture private key and presents the
+         matching leaf certificate. *)
+      val cvServerCfg = {
+        x25519PrivateKey = serverPriv, p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "", extensions = [],
+        certChain = [cvLeafDer], rsaPrivateKeyDer = cvKeyDer,
+        sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+
+      fun runCvHandshake (clientCfg, serverCfg) =
+        let
+          val (ccst0, cch) = TlsClient.startHandshake clientCfg
+          val csst0 = TlsServer.receiveClientHello (hsBody cch)
+          val (csst1, csh) = TlsServer.produceServerHello (csst0, serverCfg)
+          val (ccst1, _) = TlsClient.step (ccst0, csh)
+          val (_, cflight) = TlsServer.produceServerFlight (csst1, serverCfg)
+          val (ccst2, _) = TlsClient.step (ccst1, cflight)
+        in
+          ccst2
+        end
+
+      val cvOkCst = runCvHandshake (cvClientCfg, cvServerCfg)
+      val () = checkBool ("CV e2e: client connected")
+        (true, TlsClient.isConnected cvOkCst)
+      val () = checkBool ("CV e2e: no client error")
+        (true, not (Option.isSome (TlsClient.error cvOkCst)))
+      val () = checkBool ("CV e2e: CertificateVerify was verified")
+        (true, TlsClient.certVerified cvOkCst)
+
+      (* Negative 1: client offers a sigAlgs list WITHOUT 0x0804.  The CV
+         scheme is not acceptable -> fatal illegal_parameter, no connect. *)
+      val cvBadAlgClientCfg = {
+        x25519PrivateKey = clientPriv, p256PrivateKey = NONE,
+        clientRandom = clientRandom, legacySessionId = "",
+        cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
+        extensions = [], serverName = "example.test",
+        trustStore = [], now = 0,
+        sigAlgs = [TlsHandshake.sigRsaPssRsaSha384]   (* omits 0x0804 *)
+      } : TlsClient.clientConfig
+      val cvBadAlgCst = runCvHandshake (cvBadAlgClientCfg, cvServerCfg)
+      val () = checkBool ("CV neg (sigAlg not offered): not connected")
+        (true, not (TlsClient.isConnected cvBadAlgCst))
+      val () = checkBool ("CV neg (sigAlg not offered): illegal_parameter")
+        (true, TlsClient.error cvBadAlgCst
+                 = SOME (TlsAlert.alertDescriptionToByte
+                           TlsAlert.IllegalParameter))
+      val () = checkBool ("CV neg (sigAlg not offered): not verified")
+        (true, not (TlsClient.certVerified cvBadAlgCst))
+
+      (* Negative 2: server signs with the fixture key but presents a
+         DIFFERENT leaf cert (A2 fixture) whose public key does not match.
+         The PSS verification fails -> fatal decrypt_error. *)
+      val mismatchLeafDer = readBin "test/fixtures/certs/leaf.der"
+      val cvMismatchServerCfg = {
+        x25519PrivateKey = serverPriv, p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "", extensions = [],
+        certChain = [mismatchLeafDer], rsaPrivateKeyDer = cvKeyDer,
+        sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+      val cvMismatchCst = runCvHandshake (cvClientCfg, cvMismatchServerCfg)
+      val () = checkBool ("CV neg (cert mismatch): not connected")
+        (true, not (TlsClient.isConnected cvMismatchCst))
+      val () = checkBool ("CV neg (cert mismatch): decrypt_error")
+        (true, TlsClient.error cvMismatchCst
+                 = SOME (TlsAlert.alertDescriptionToByte
+                           TlsAlert.DecryptError))
+      val () = checkBool ("CV neg (cert mismatch): not verified")
+        (true, not (TlsClient.certVerified cvMismatchCst))
     in
       ()
     end

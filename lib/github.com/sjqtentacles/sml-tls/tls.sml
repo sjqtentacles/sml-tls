@@ -815,8 +815,40 @@ struct
   val clientCertVerifyContext = "TLS 1.3, client CertificateVerify"
   val serverCertVerifyContext = "TLS 1.3, server CertificateVerify"
 
+  (* RFC 8446 sec. 4.4.3: 64 octets of 0x20, the context string, a single
+     0x00 octet, then the content (transcript hash) to be signed. *)
   fun certificateVerifyInput {contextString, transcriptHash} =
-    certificateVerifyPrefix ^ contextString ^ " " ^ transcriptHash
+    certificateVerifyPrefix ^ contextString ^ String.str (Char.chr 0) ^ transcriptHash
+
+  (* rsa_pss_rsae_sha256 (RFC 8446 §4.2.3): SHA-256 + RSA-PSS, salt = 32. *)
+  val sigRsaPssRsaeSha256 = 0wx0804 : Word16.word
+  (* Fixed 32-byte (all-zero) PSS salt so signatures are reproducible across
+     MLton and Poly/ML. *)
+  val cvFixedSalt = String.implode (List.tabulate (32, fn _ => Char.chr 0))
+
+  fun signServerCertVerify {priv, sigAlg, transcript} =
+    if sigAlg = sigRsaPssRsaeSha256 then
+      let
+        val input = certificateVerifyInput
+          {contextString = serverCertVerifyContext,
+           transcriptHash = transcriptHash transcript}
+      in
+        Rsa.signPss {priv = priv, hash = Rsa.SHA256, salt = cvFixedSalt,
+                     msg = input}
+      end
+    else raise Fail "signServerCertVerify: unsupported signature scheme"
+
+  fun verifyServerCertVerify {pub, sigAlg, transcript, sgn} =
+    if sigAlg = sigRsaPssRsaeSha256 then
+      let
+        val input = certificateVerifyInput
+          {contextString = serverCertVerifyContext,
+           transcriptHash = transcriptHash transcript}
+      in
+        Rsa.verifyPss {pub = pub, hash = Rsa.SHA256, saltLen = 32,
+                       msg = input, sgn = sgn}
+      end
+    else false
 
   fun finishedVerifyData {finishedKey, transcript} =
     Hmac.hmacSha256 finishedKey (transcriptHash transcript)

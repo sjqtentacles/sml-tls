@@ -412,7 +412,8 @@ struct
       val serverHsSecret = Option.valOf (#serverHsSecret st)
       val clientHsSecret = Option.valOf (#clientHsSecret st)
       val (keyLen, ivLen) = suiteKeyIvLen cs
-      fun loop (remaining, transcript, certOk) =
+      val offeredSigAlgs = #sigAlgs (#config st)
+      fun loop (remaining, transcript, certOk, leafCert) =
         if remaining = "" then
           (* flight without a Finished: stay un-connected, just record. *)
           ({ config = #config st, x25519PrivateKey = #x25519PrivateKey st,
@@ -438,8 +439,62 @@ struct
                 in
                   case msgType of
                       TlsHandshake.Certificate =>
-                        (verifyServerCert (st, body);
-                         loop (rest, transcript', true))
+                        let
+                          (* Capture the leaf (first entry) so a later
+                             CertificateVerify can be checked against it. *)
+                          val leaf =
+                            case TlsHandshake.decodeCertificate body of
+                                SOME {certificateList = (e :: _), ...} =>
+                                  SOME (#certData e)
+                              | _ => NONE
+                        in
+                          verifyServerCert (st, body);
+                          loop (rest, transcript', true, leaf)
+                        end
+                    | TlsHandshake.CertificateVerify =>
+                        (case TlsHandshake.decodeCertificateVerify body of
+                             NONE => raise Fatal TlsAlert.DecodeError
+                           | SOME {sigAlg, sigBytes} =>
+                               (* Gate real verification on a non-empty
+                                  signature so legacy empty-sig handshakes
+                                  (no server key configured) still pass. *)
+                               if sigBytes = "" then
+                                 loop (rest, transcript', certOk, leafCert)
+                               else
+                                 let
+                                   (* (1) the CV scheme must be one the client
+                                      offered in signature_algorithms. *)
+                                   val () =
+                                     if List.exists (fn a => a = sigAlg)
+                                                    offeredSigAlgs
+                                     then ()
+                                     else raise Fatal TlsAlert.IllegalParameter
+                                   (* (2) extract the leaf's RSA public key. *)
+                                   val pub =
+                                     case leafCert of
+                                         NONE => raise Fatal TlsAlert.DecryptError
+                                       | SOME der =>
+                                           (case (X509.rsaPublicKey
+                                                    (X509.parse der)
+                                                  handle _ => NONE) of
+                                                SOME p => p
+                                              | NONE =>
+                                                  raise Fatal
+                                                    TlsAlert.BadCertificate)
+                                   (* (3) verify the signature over the
+                                      transcript hash THROUGH Certificate
+                                      (i.e. the transcript before this CV). *)
+                                   val ok =
+                                     TlsKeySchedule.verifyServerCertVerify
+                                       {pub = pub, sigAlg = sigAlg,
+                                        transcript = transcript,
+                                        sgn = sigBytes}
+                                   val () =
+                                     if ok then ()
+                                     else raise Fatal TlsAlert.DecryptError
+                                 in
+                                   loop (rest, transcript', true, leafCert)
+                                 end)
                     | TlsHandshake.Finished =>
                         let
                           (* Verify the server Finished MAC over the transcript
@@ -502,10 +557,10 @@ struct
                         in
                           (st', [cfRecord])
                         end
-                    | _ => loop (rest, transcript', certOk)
+                    | _ => loop (rest, transcript', certOk, leafCert)
                 end
     in
-      loop (hs, #transcript st, #certVerified st)
+      loop (hs, #transcript st, #certVerified st, NONE)
     end
 
   (* Update just the server-app read protect-state. *)
@@ -688,6 +743,8 @@ struct
   fun clientAppKey (st : clientState) = #clientAppKey st
   fun transcript (st : clientState) = #transcript st
   fun isConnected (st : clientState) = #connected st
+
+  fun certVerified (st : clientState) = #certVerified st
 end
 
 structure TlsServer :> TLS_SERVER =
@@ -937,14 +994,22 @@ struct
         {certificateRequestContext = "", certificateList = certEntries}
       val certMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.Certificate, body = certBody}
-      (* CertificateVerify: the CV signature is produced/verified by the
-         caller via sml-rsa / sml-p256.  This minimal server emits a
-         structurally-valid CV with an empty signature; the client skips CV
-         signature verification in this build (handshake authenticity is
-         carried by the Finished MAC over the shared transcript). *)
+      (* CertificateVerify (RFC 8446 §4.4.3).  When an RSA private key is
+         configured, RSA-PSS-sign the transcript hash THROUGH the Certificate
+         message and emit a real signature.  When no key is configured
+         (`rsaPrivateKeyDer = ""`), fall back to the legacy empty-signature CV
+         (handshake authenticity then rides only on the Finished MAC); this
+         keeps PKI-less handshake tests working. *)
       val tBeforeCv = #transcript st ^ eeMsg ^ certMsg
+      val cvSigBytes =
+        if #rsaPrivateKeyDer cfg = "" then ""
+        else
+          let val priv = Rsa.decodePkcs8Der (#rsaPrivateKeyDer cfg) in
+            TlsKeySchedule.signServerCertVerify
+              {priv = priv, sigAlg = #sigAlg cfg, transcript = tBeforeCv}
+          end
       val cvBody = TlsHandshake.encodeCertificateVerify
-        {sigAlg = #sigAlg cfg, sigBytes = ""}
+        {sigAlg = #sigAlg cfg, sigBytes = cvSigBytes}
       val cvMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.CertificateVerify, body = cvBody}
       (* Server Finished over the transcript through CertificateVerify. *)
