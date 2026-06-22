@@ -372,10 +372,15 @@ struct
         Char.chr ((i + 1) mod 256)))
       val clientCfg = {
         x25519PrivateKey = clientPriv,
+        p256PrivateKey = NONE,
         clientRandom = clientRandom,
         legacySessionId = "",
         cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
-        extensions = []
+        extensions = [],
+        serverName = "example.com",
+        trustStore = [],
+        now = 0,
+        sigAlgs = []
       } : TlsClient.clientConfig
       val (cst0, chRecord) = TlsClient.startHandshake clientCfg
       val () = checkBool ("startHandshake returns bytes") (true, chRecord <> "")
@@ -385,6 +390,211 @@ struct
                      checkBool ("record is handshake") (true,
                        #contentType r = TlsRecord.Handshake)
                  | _ => checkBool "record parses" (true, false)
+
+      (* =============================================================== *)
+      (* J1 integration: client <-> server full handshake + post-handshake *)
+      (* =============================================================== *)
+
+      (* Pull the handshake-message body out of a plaintext record. *)
+      fun hsBody record =
+        case TlsRecord.decodePlaintext record of
+            SOME (r, _) =>
+              (case TlsHandshake.decodeMessage (#fragment r) of
+                   SOME ({body, ...}, _) => body
+                 | _ => raise Fail "hsBody: no handshake message")
+          | _ => raise Fail "hsBody: not a plaintext record"
+
+      (* Pull the AEAD-protected body out of a ciphertext record. *)
+      fun ctBody record =
+        case TlsRecord.decodeCiphertext record of
+            SOME (r, _) => #encryptedRecord r
+          | NONE => raise Fail "ctBody: not a ciphertext record"
+
+      val serverPriv = String.implode (List.tabulate (32, fn i =>
+        Char.chr ((i * 7 + 3) mod 256)))
+      val serverCfg = {
+        x25519PrivateKey = serverPriv,
+        p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "",
+        extensions = [],
+        certChain = [],
+        rsaPrivateKeyDer = "",
+        sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0,
+        sigAlgs = []
+      } : TlsServer.serverConfig
+
+      (* ---- J1: full 1-RTT handshake (capstone) ---- *)
+      val () = section "J1: client/server full 1-RTT handshake"
+      val sst0 = TlsServer.receiveClientHello (hsBody chRecord)
+      val (sst1, shRecord) = TlsServer.produceServerHello (sst0, serverCfg)
+      val (cst1, _) = TlsClient.step (cst0, shRecord)
+      val () = checkBool ("client negotiated suite")
+        (true, TlsClient.negotiatedCipherSuite cst1
+                 = SOME TlsHandshake.suiteTlsAes128GcmSha256)
+      val (sst2, flight) = TlsServer.produceServerFlight (sst1, serverCfg)
+      val (cst2, clientOut) = TlsClient.step (cst1, flight)
+      val () = checkBool ("client connected after server flight")
+        (true, TlsClient.isConnected cst2)
+      val () = checkBool ("client emits one Finished record")
+        (true, List.length clientOut = 1)
+      val (sst3, _) = TlsServer.step (sst2, List.hd clientOut)
+      val () = checkBool ("server connected after client Finished")
+        (true, TlsServer.isConnected sst3)
+      (* Both sides agreed on the same application-traffic keys. *)
+      val () = checkBool ("server/client agree on server app key")
+        (true, TlsServer.serverAppKey sst3 = TlsClient.serverAppKey cst2)
+      val () = checkBool ("server/client agree on client app key")
+        (true, TlsServer.clientAppKey sst3 = TlsClient.clientAppKey cst2)
+
+      (* ---- J1: application data round-trip + sequence numbers ---- *)
+      val () = section "J1: application data + incrementing sequence numbers"
+      val (cst3, appRec0) = TlsClient.sendApplicationData (cst2, "message one")
+      val (cst4, appRec1) = TlsClient.sendApplicationData (cst3, "message two")
+      val () = checkBool ("two app records use different nonces (ciphertext differs)")
+        (true, appRec0 <> appRec1)
+      (* Decrypt them with the server's view of the client app key, in order. *)
+      val (cak, caiv) = Option.valOf (TlsClient.clientAppKey cst2)
+      val rd0 = TlsRecordProtect.init {key = cak, iv = caiv}
+      val () = case TlsRecordProtect.unprotect {state = rd0, record = ctBody appRec0} of
+                   SOME (_, pt, rd1) =>
+                     (checkBytes ("record 0 (seq 0) decrypts", "message one", pt);
+                      case TlsRecordProtect.unprotect {state = rd1, record = ctBody appRec1} of
+                          SOME (_, pt2, _) =>
+                            checkBytes ("record 1 (seq 1) decrypts", "message two", pt2)
+                        | NONE => checkBool "record 1 decrypts" (true, false))
+                 | NONE => checkBool "record 0 decrypts" (true, false)
+
+      (* ---- J1: KeyUpdate rekeys the client application traffic key ---- *)
+      val () = section "J1: KeyUpdate rekey"
+      val (cstK, kuRec) = TlsClient.requestKeyUpdate cst2
+      val () = checkBool ("client app key changes after KeyUpdate")
+        (true, TlsClient.clientAppKey cstK <> TlsClient.clientAppKey cst2)
+      val (sstK, _) = TlsServer.step (sst3, kuRec)
+      val () = checkBool ("server rekeys client-read after KeyUpdate")
+        (true, TlsServer.clientAppKey sstK = TlsClient.clientAppKey cstK)
+      val (_, appRecK) = TlsClient.sendApplicationData (cstK, "after rekey")
+      val (nck, nciv) = Option.valOf (TlsClient.clientAppKey cstK)
+      val rdK = TlsRecordProtect.init {key = nck, iv = nciv}
+      val () = case TlsRecordProtect.unprotect {state = rdK, record = ctBody appRecK} of
+                   SOME (_, pt, _) => checkBytes ("app data under new key", "after rekey", pt)
+                 | NONE => checkBool "app data under new key" (true, false)
+
+      (* ---- J1: NewSessionTicket issuance round-trip ---- *)
+      val () = section "J1: NewSessionTicket round-trip"
+      val nst = {
+        ticketLifetime = 0w7200,
+        ticketAgeAdd = 0w12345,
+        ticketNonce = bytes [0, 1],
+        ticket = "opaque-session-ticket",
+        extensions = []
+      } : TlsHandshake.newSessionTicket
+      val nstBody = TlsHandshake.encodeNewSessionTicket nst
+      val (_, nstRec) = TlsServer.produceNewSessionTicket (sst3, serverCfg, nstBody)
+      val (sak, saiv) = Option.valOf (TlsServer.serverAppKey sst3)
+      val rdN = TlsRecordProtect.init {key = sak, iv = saiv}
+      val () = case TlsRecordProtect.unprotect {state = rdN, record = ctBody nstRec} of
+                   SOME (TlsRecord.Handshake, pt, _) =>
+                     (case TlsHandshake.decodeMessage pt of
+                          SOME ({msgType = TlsHandshake.NewSessionTicket, body}, _) =>
+                            (case TlsHandshake.decodeNewSessionTicket body of
+                                 SOME nst' =>
+                                   checkBytes ("NST ticket round-trips",
+                                     "opaque-session-ticket", #ticket nst')
+                               | NONE => checkBool "NST decodes" (true, false))
+                        | _ => checkBool "NST message type" (true, false))
+                 | _ => checkBool "NST record decrypts as handshake" (true, false)
+
+      (* ---- J1: ServerHello cipher-suite mismatch -> illegal_parameter ---- *)
+      val () = section "J1: ServerHello suite mismatch -> illegal_parameter"
+      val badSuiteCfg = {
+        x25519PrivateKey = serverPriv, p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes256GcmSha384,  (* not offered *)
+        legacySessionId = "", extensions = [], certChain = [],
+        rsaPrivateKeyDer = "", sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+      val (bSst, badSuiteSh) =
+        TlsServer.produceServerHello (TlsServer.receiveClientHello (hsBody chRecord), badSuiteCfg)
+      val (cstBad, _) = TlsClient.step (cst0, badSuiteSh)
+      val () = checkBool ("suite mismatch -> illegal_parameter")
+        (true, TlsClient.error cstBad
+                 = SOME (TlsAlert.alertDescriptionToByte TlsAlert.IllegalParameter))
+      val () = checkBool ("client not connected after suite mismatch")
+        (true, not (TlsClient.isConnected cstBad))
+
+      (* ---- J1: downgrade sentinel in ServerHello.random -> illegal_parameter ---- *)
+      val () = section "J1: downgrade sentinel -> illegal_parameter"
+      val dgRandom =
+        String.substring (serverRandom, 0, 24) ^ TlsExtensions.downgradeSentinelTls12
+      val dgCfg = {
+        x25519PrivateKey = serverPriv, p256PrivateKey = NONE,
+        serverRandom = dgRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "", extensions = [], certChain = [],
+        rsaPrivateKeyDer = "", sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+      val (_, dgSh) =
+        TlsServer.produceServerHello (TlsServer.receiveClientHello (hsBody chRecord), dgCfg)
+      val (cstDg, _) = TlsClient.step (cst0, dgSh)
+      val () = checkBool ("downgrade sentinel -> illegal_parameter")
+        (true, TlsClient.error cstDg
+                 = SOME (TlsAlert.alertDescriptionToByte TlsAlert.IllegalParameter))
+
+      (* ---- J1: ServerHello selected_version != TLS 1.3 -> protocol_version ---- *)
+      val () = section "J1: version mismatch -> protocol_version"
+      val verSh = {
+        legacyVersion = 0wx0303, random = serverRandom, legacySessionId = "",
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacyCompression = 0w0,
+        extensions = [
+          {extType = TlsHandshake.extSupportedVersions,
+           data = TlsHandshake.word16ToBytes 0wx0303}  (* TLS 1.2, not 1.3 *)
+        ]
+      } : TlsHandshake.serverHello
+      val verShRec = TlsRecord.encodePlaintext
+        {contentType = TlsRecord.Handshake,
+         fragment = TlsHandshake.encodeMessage
+           {msgType = TlsHandshake.ServerHello,
+            body = TlsHandshake.encodeServerHello verSh}}
+      val (cstVer, _) = TlsClient.step (cst0, verShRec)
+      val () = checkBool ("version mismatch -> protocol_version")
+        (true, TlsClient.error cstVer
+                 = SOME (TlsAlert.alertDescriptionToByte TlsAlert.ProtocolVersion))
+
+      (* ---- J1: certificate verification wired at the Certificate step ---- *)
+      val () = section "J1: certificate verification rejects a bad chain"
+      val trustingCfg = {
+        x25519PrivateKey = clientPriv, p256PrivateKey = NONE,
+        clientRandom = clientRandom, legacySessionId = "",
+        cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
+        extensions = [], serverName = "example.com",
+        trustStore = ["not-a-real-anchor"],   (* forces verifyChain to run *)
+        now = 0, sigAlgs = []
+      } : TlsClient.clientConfig
+      val (tcst0, tchRecord) = TlsClient.startHandshake trustingCfg
+      val badCertServerCfg = {
+        x25519PrivateKey = serverPriv, p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "", extensions = [],
+        certChain = ["bogus-leaf-der"],        (* will not verify *)
+        rsaPrivateKeyDer = "", sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+      val tsst0 = TlsServer.receiveClientHello (hsBody tchRecord)
+      val (tsst1, tShRecord) = TlsServer.produceServerHello (tsst0, badCertServerCfg)
+      val (tcst1, _) = TlsClient.step (tcst0, tShRecord)
+      val (tsst2, tFlight) = TlsServer.produceServerFlight (tsst1, badCertServerCfg)
+      val (tcstErr, _) = TlsClient.step (tcst1, tFlight)
+      val () = checkBool ("bad chain -> client error set")
+        (true, Option.isSome (TlsClient.error tcstErr))
+      val () = checkBool ("bad chain -> client not connected")
+        (true, not (TlsClient.isConnected tcstErr))
     in
       ()
     end

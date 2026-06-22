@@ -1,0 +1,206 @@
+(* chacha20_test.cml -- RFC 8439 test vectors for the CakeML ChaCha20 port.
+
+   Vectors:
+     1. Block function (RFC 8439 sec 2.3.2): known key/nonce/counter -> known 64-byte block
+     2. Encryption (RFC 8439 sec 2.4.2): key "000102...1f", nonce "000000090000004a00000000",
+        counter 1, plaintext "Ladies and Gentlemen..." -> known ciphertext.
+
+   The harness inlines the structure because `cake` compiles a single
+   source file.  The canonical port is chacha20.sml. *)
+
+structure ChaCha20 = struct
+
+  val mask32 : Word64.word = 0wxFFFFFFFF
+
+  fun add32 a b = Word64.andb (Word64.+ a b) mask32
+  fun andb a b = Word64.andb a b
+  fun orb  a b = Word64.orb a b
+  fun xorb a b = Word64.xorb a b
+  fun lsl32 a b = Word64.andb (Word64.<< a b) mask32
+  fun lsr  a b = Word64.>> a b
+
+  fun rotl32 x n =
+    orb (lsl32 x n) (lsr x (32 - n))
+
+  fun getLE32 s off =
+    let val b0 = Word64.fromInt (Char.ord (String.sub s off))
+        val b1 = Word64.fromInt (Char.ord (String.sub s (off+1)))
+        val b2 = Word64.fromInt (Char.ord (String.sub s (off+2)))
+        val b3 = Word64.fromInt (Char.ord (String.sub s (off+3)))
+    in
+      orb (orb (orb b0 (lsl32 b1 8)) (lsl32 b2 16)) (lsl32 b3 24)
+    end
+
+  fun putLE32 w =
+    let fun b n = Char.chr (Word64.toInt (andb (lsr w (n*8)) 0wxFF))
+    in String.implode [b 0, b 1, b 2, b 3] end
+
+  val sigma0 = 0wx61707865 : Word64.word
+  val sigma1 = 0wx3320646e : Word64.word
+  val sigma2 = 0wx79622d32 : Word64.word
+  val sigma3 = 0wx6b206574 : Word64.word
+
+  fun qr sa sb sc sd =
+    ( sa := add32 (!sa) (!sb)
+    ; sd := rotl32 (xorb (!sd) (!sa)) 16
+    ; sc := add32 (!sc) (!sd)
+    ; sb := rotl32 (xorb (!sb) (!sc)) 12
+    ; sa := add32 (!sa) (!sb)
+    ; sd := rotl32 (xorb (!sd) (!sa)) 8
+    ; sc := add32 (!sc) (!sd)
+    ; sb := rotl32 (xorb (!sb) (!sc)) 7 )
+
+  fun block key nonce counter =
+    let
+      val init = Array.fromList
+        [ sigma0, sigma1, sigma2, sigma3
+        , getLE32 key 0,  getLE32 key 4,  getLE32 key 8,  getLE32 key 12
+        , getLE32 key 16, getLE32 key 20, getLE32 key 24, getLE32 key 28
+        , counter
+        , getLE32 nonce 0, getLE32 nonce 4, getLE32 nonce 8 ]
+      val st = Array.tabulate 16 (fn i => Ref (Array.sub init i))
+      fun s i = Array.sub st i
+
+      fun doubleRound () =
+        ( qr (s 0) (s 4) (s 8)  (s 12)
+        ; qr (s 1) (s 5) (s 9)  (s 13)
+        ; qr (s 2) (s 6) (s 10) (s 14)
+        ; qr (s 3) (s 7) (s 11) (s 15)
+        ; qr (s 0) (s 5) (s 10) (s 15)
+        ; qr (s 1) (s 6) (s 11) (s 12)
+        ; qr (s 2) (s 7) (s 8)  (s 13)
+        ; qr (s 3) (s 4) (s 9)  (s 14) )
+
+      fun doRounds n = if n <= 0 then () else (doubleRound (); doRounds (n - 1))
+      val () = doRounds 10
+
+      val out = Array.tabulate 16 (fn i => add32 (! (s i)) (Array.sub init i))
+    in
+      String.concat (List.tabulate 16 (fn i => putLE32 (Array.sub out i)))
+    end
+
+  fun xorStream key nonce msg startCtr =
+    let
+      val mlen = String.size msg
+      val buf = Array.array mlen #"\000"
+      val nblk = mlen div 64
+      val rem = mlen mod 64
+
+      fun fullBlock b =
+        let val ks = block key nonce (add32 startCtr (Word64.fromInt b))
+        in
+          List.app
+            (fn i =>
+              let val off = b*64 + i
+                  val mb = Word8.fromInt (Char.ord (String.sub msg off))
+                  val kb = Word8.fromInt (Char.ord (String.sub ks i))
+              in Array.update buf off (Char.chr (Word8.toInt (Word8.xorb mb kb))) end)
+            (List.tabulate 64 (fn i => i))
+        end
+      val () = List.app fullBlock (List.tabulate nblk (fn i => i))
+
+      fun tail () =
+        if rem > 0 then
+          let val ks = block key nonce (add32 startCtr (Word64.fromInt nblk))
+              val off0 = nblk * 64
+          in
+            List.app
+              (fn i =>
+                let val mb = Word8.fromInt (Char.ord (String.sub msg (off0 + i)))
+                    val kb = Word8.fromInt (Char.ord (String.sub ks i))
+                in Array.update buf (off0 + i)
+                     (Char.chr (Word8.toInt (Word8.xorb mb kb))) end)
+              (List.tabulate rem (fn i => i))
+          end
+        else ()
+      val () = tail ()
+    in
+      String.implode (Array.foldr (fn x => fn xs => x :: xs) [] buf)
+    end
+
+  fun encrypt key nonce msg = xorStream key nonce msg 0w1
+  fun decrypt key nonce ct  = xorStream key nonce ct  0w1
+
+  val hexChars = "0123456789abcdef"
+
+  fun toHex s =
+    String.concat
+      (List.map
+        (fn c =>
+          let val v = Char.ord c
+          in String.str (String.sub hexChars (v div 16)) ^
+             String.str (String.sub hexChars (v mod 16))
+          end)
+        (String.explode s))
+
+  fun bytesToHex s = toHex s
+
+end
+
+(* ---------- hex decoder for test setup ---------- *)
+
+fun hexVal (c : char) =
+  if Char.>= c #"0" andalso Char.<= c #"9" then Some (Char.ord c - Char.ord #"0")
+  else if Char.>= c #"a" andalso Char.<= c #"f" then Some (Char.ord c - Char.ord #"a" + 10)
+  else if Char.>= c #"A" andalso Char.<= c #"F" then Some (Char.ord c - Char.ord #"A" + 10)
+  else None
+
+fun fromHex s =
+  let val n = String.size s
+  in
+    if n mod 2 <> 0 then None
+    else
+      let
+        fun loop i acc =
+          if i >= n then Some (String.implode (List.rev acc))
+          else
+            case (hexVal (String.sub s i), hexVal (String.sub s (i+1))) of
+                (Some hi, Some lo) => loop (i+2) (Char.chr (hi*16+lo) :: acc)
+              | _ => None
+      in loop 0 [] end
+  end
+
+fun check (name, got, expected) =
+  if String.= got expected then
+    print ("PASS " ^ name ^ "\n" ^ got ^ "\n")
+  else
+    print ("FAIL " ^ name ^ "\n  expected: " ^ expected ^ "\n  got:      " ^ got ^ "\n");
+
+(* ---------- RFC 8439 sec 2.3.2 block test ---------- *)
+
+val blockKey = Option.valOf (fromHex
+  "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+val blockNonce = Option.valOf (fromHex
+  "000000090000004a00000000")
+val blockCounter = 0w1 : Word64.word
+val blockExpected =
+  "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e" ^
+  "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"
+
+val blockGot = ChaCha20.bytesToHex (ChaCha20.block blockKey blockNonce blockCounter);
+val _ = check ("block sec 2.3.2", blockGot, blockExpected);
+
+(* ---------- RFC 8439 sec 2.4.2 encryption test ---------- *)
+
+val encKey = blockKey
+val encNonce = Option.valOf (fromHex
+  "000000000000004a00000000")
+val encPlain = String.concat
+  [ "Ladies and Gentlemen of the class of '99: If I could offer you o"
+  , "nly one tip for the future, sunscreen would be it."
+  ]
+val encExpected =
+  "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b" ^
+  "f91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d8" ^
+  "07ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab7793736" ^
+  "5af90bbf74a35be6b40b8eedf2785e42874d"
+
+val encGot = ChaCha20.bytesToHex (ChaCha20.encrypt encKey encNonce encPlain);
+val _ = check ("encrypt sec 2.4.2", encGot, encExpected);
+
+(* ---------- round-trip test ---------- *)
+
+val rt = ChaCha20.decrypt encKey encNonce (ChaCha20.encrypt encKey encNonce encPlain);
+val _ = check ("roundtrip", rt, encPlain);
+
+val _ = print "DONE\n";

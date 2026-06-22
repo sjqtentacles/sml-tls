@@ -1,0 +1,882 @@
+(* bigint.sml -- CakeML port of sml-bigint.
+
+   Arbitrary-precision signed integers, sign-magnitude over base-2^32
+   limbs (little-endian Word64 vectors, emulating Word32 via the
+   Word64+mask shim).
+
+   The original targets SML implementations where Int.int is fixed-width
+   and IntInf is the bignum type.  In CakeML, `int` is already
+   arbitrary-precision, so `IntInf` is unnecessary and `toInt` never
+   overflows.  The limb-level arithmetic is ported faithfully (it is the
+   algorithmic core: Karatsuba multiplication, binary long division, etc.).
+   The sign-magnitude wrapper is preserved so the public API matches.
+
+   Scope (per task): fromInt, toInt, fromString, toString, compare, add,
+   sub, mul, divMod.  Also included: sign, abs, negate, quotRem, pow, gcd,
+   modpow, and the bitwise/byte-serialization ops where they port cleanly.
+
+   Dialect-gap fixes (see SPIKE_REPORT.md and the other PORT_NOTES):
+     - Word32 emulated via Word64 + 0wxFFFFFFFF mask (add32/lsl32/etc.)
+     - Word32.toLarge/fromLarge dropped (already on Word64)
+     - Word.fromInt (shift counts) -> plain int (CakeML shifts take int)
+     - multi-clause fun (pack, allTrials) rewritten as if/case
+     - op~/op+/op-/op* -> regular named functions (negate/add/sub/mul)
+     - handle Overflow -> dropped (CakeML int is bignum, no overflow)
+     - SOME/NONE -> Some/None; true/false -> True/False
+     - no signatures / :> SIG
+*)
+
+structure BigInt = struct
+
+  (* ===== limb-level helpers (operating on Word64.word vectors, emulating Word32) ===== *)
+
+  type limb = Word64.word
+  type mag  = limb Vector.vector
+
+  val mask32 : Word64.word = 0wxFFFFFFFF
+  fun add32 a b = Word64.andb (Word64.+ a b) mask32
+  fun andb a b = Word64.andb a b
+  fun orb  a b = Word64.orb a b
+  fun xorb a b = Word64.xorb a b
+  fun lsl32 a b = Word64.andb (Word64.<< a b) mask32
+  fun lsr  a b = Word64.>> a b
+  fun notb w = Word64.xorb w mask32
+
+  (* a*b mod 2^32, plus the carry (high 32 bits of the product).
+     CakeML's Word64 has no multiplication, so compute via int. *)
+  fun mul32c a b =
+    let val ai = Word64.toInt a
+        val bi = Word64.toInt b
+        val prod = ai * bi
+    in (Word64.andb (Word64.fromInt prod) mask32, Word64.>> (Word64.fromInt prod) 32) end
+
+  val base64 : Word64.word = 0wx100000000   (* 2^32 *)
+
+  val empty : mag = Vector.fromList []
+  val oneMag : mag = Vector.fromList [0w1]
+
+  fun magIsZero (m) = Vector.length m = 0
+
+  (* Drop trailing (high-order) zero limbs from an array, yielding a vector. *)
+  fun normArr (a) =
+
+    let
+      fun top i = if i < 0 then ~1
+                  else if not (Word64.= (Array.sub a i) 0w0) then i
+                  else top (i - 1)
+      val hi = top (Array.length a - 1)
+    in
+      if hi < 0 then empty
+      else Vector.tabulate (hi + 1) (fn i => Array.sub a i)
+    end
+
+  fun normVec (v) =
+
+    let
+      fun top i = if i < 0 then ~1
+                  else if not (Word64.= (Vector.sub v i) 0w0) then i
+                  else top (i - 1)
+      val hi = top (Vector.length v - 1)
+    in
+      if hi < 0 then empty
+      else if hi + 1 = Vector.length v then v
+      else Vector.tabulate (hi + 1) (fn i => Vector.sub v i)
+    end
+
+  fun magCompare (a, b) =
+    let
+      val la = Vector.length a
+      val lb = Vector.length b
+    in
+      if la <> lb then Int.compare la lb
+      else
+        let
+          fun loop i =
+            if i < 0 then Equal
+            else
+              let val x = Vector.sub a i
+                  val y = Vector.sub b i
+              in
+                if Word64.= x y then loop (i - 1)
+                else if Word64.< x y then Less else Greater
+              end
+        in loop (la - 1) end
+    end
+
+  fun magAdd (a, b) =
+
+    let
+      val la = Vector.length a
+      val lb = Vector.length b
+      val n = if la > lb then la else lb
+      fun la' i = if i < la then Vector.sub a i else 0w0
+      fun lb' i = if i < lb then Vector.sub b i else 0w0
+      val res = Array.array (n + 1) (0w0 : limb)
+      fun loop (i, carry) =
+        if i >= n then Array.update res n carry
+        else
+          let val sum = add32 (add32 (la' i) (lb' i)) carry
+              val carry2 = Word64.>> (Word64.+ (Word64.+ (la' i) (lb' i)) carry) 32
+          in
+            Array.update res i sum;
+            loop (i + 1, carry2)
+          end
+    in
+      loop (0, 0w0); normArr res
+    end
+
+  (* Precondition: a >= b (as magnitudes). *)
+  fun magSub (a, b) =
+
+    let
+      val la = Vector.length a
+      val lb = Vector.length b
+      fun lb' i = if i < lb then Vector.sub b i else 0w0
+      val res = Array.array la (0w0 : limb)
+      fun loop (i, borrow) =
+        if i >= la then ()
+        else
+          let
+            val ai = Vector.sub a i
+            val bi = Word64.+ (lb' i) borrow
+          in
+            if Word64.>= ai bi
+            then (Array.update res i (Word64.- ai bi); loop (i + 1, 0w0))
+            else (Array.update res i (Word64.- (Word64.+ ai base64) bi);
+                  loop (i + 1, 0w1))
+          end
+    in
+      loop (0, 0w0); normArr res
+    end
+
+  fun magMulSchool (a, b) =
+
+    let
+      val la = Vector.length a
+      val lb = Vector.length b
+    in
+      if la = 0 orelse lb = 0 then empty
+      else
+        let
+          val res = Array.array (la + lb) (0w0 : limb)
+          fun outer i =
+            if i >= la then ()
+            else
+              let
+                val ai = Vector.sub a i
+                fun inner (j, carry) =
+                  if j >= lb
+                  then Array.update res (i + lb) carry
+                  else
+                    let
+                      val cur = Array.sub res (i + j)
+                      val (plo, phi) = mul32c ai (Vector.sub b j)
+                      val prod = Word64.+ (Word64.+ (Word64.+ plo phi) cur) carry
+                    in
+                      Array.update res (i + j) (Word64.andb prod mask32);
+                      inner (j + 1, Word64.>> prod 32)
+                    end
+              in
+                inner (0, 0w0); outer (i + 1)
+              end
+        in
+          outer 0; normArr res
+        end
+    end
+
+  (* Shift a magnitude left by [k] whole limbs (multiply by base^k). *)
+  fun shiftLimbs (v, k) =
+
+    if Vector.length v = 0 then empty
+    else Vector.tabulate (Vector.length v + k,
+            fn i => if i < k then 0w0 else Vector.sub v (i - k))
+
+  (* Low [m] limbs / the rest, as a (low, high) split. *)
+  fun splitAt (v, m) =
+
+    let val n = Vector.length v
+    in
+      if m >= n then (v, empty)
+      else (normVec (Vector.tabulate m (fn i => Vector.sub v i)),
+            normVec (Vector.tabulate (n - m) (fn i => Vector.sub v (i + m))))
+    end
+
+  val karatsubaCutoff = 32
+
+  fun magMul (a, b) =
+
+    let
+      val la = Vector.length a
+      val lb = Vector.length b
+    in
+      if la = 0 orelse lb = 0 then empty
+      else if la < karatsubaCutoff orelse lb < karatsubaCutoff
+      then magMulSchool (a, b)
+      else
+        let
+          val m = (Int.max la lb + 1) div 2
+          val (a0, a1) = splitAt (a, m)
+          val (b0, b1) = splitAt (b, m)
+          val z0 = magMul (a0, b0)
+          val z2 = magMul (a1, b1)
+          val z1 = magSub (magSub (magMul (magAdd (a0, a1), magAdd (b0, b1))) z2) z0
+        in
+          magAdd (magAdd (shiftLimbs (z2, 2 * m), shiftLimbs (z1, m)) ) z0
+        end
+    end
+
+  (* ----- bit-level helpers for division, gcd and shifting ----- *)
+
+  fun limbBitLength (w) =
+
+    let fun loop (w, n) = if Word64.= w 0w0 then n else loop (Word64.>> w 1, n + 1)
+    in loop (w, 0) end
+
+  fun bitLength (v) =
+
+    let val n = Vector.length v
+    in if n = 0 then 0 else (n - 1) * 32 + limbBitLength (Vector.sub v (n - 1)) end
+
+  fun testBit (v, i) =
+
+    let val li = i div 32
+        val bi = i mod 32
+    in
+      li < Vector.length v
+      andalso Word64.= (Word64.andb (Word64.>> (Vector.sub v li) bi) 0w1) 0w1
+    end
+
+  (* Multiply by two and OR in a low bit (used by binary long division). *)
+  fun magShl1 (v, lowbit) =
+
+    let
+      val n = Vector.length v
+      val res = Array.array (n + 1) (0w0 : limb)
+      fun loop (i, carry) =
+        if i >= n then Array.update res n carry
+        else
+          let val x = Word64.+ (Word64.<< (Vector.sub v i) 1) carry
+          in Array.update res i (Word64.andb x mask32); loop (i + 1, Word64.>> x 32) end
+    in
+      loop (0, if lowbit then 0w1 else 0w0); normArr res
+    end
+
+  fun shrBits (v, k) =
+
+    let
+      val limbShift = k div 32
+      val bitShift = k mod 32
+      val n = Vector.length v
+    in
+      if limbShift >= n then empty
+      else
+        let
+          val m = n - limbShift
+          fun limb i = Vector.sub v (i + limbShift)
+        in
+          if bitShift = 0 then normVec (Vector.tabulate m limb)
+          else
+            normVec (Vector.tabulate m (fn i =>
+              let
+                val lo = Word64.>> (limb i) bitShift
+                val hi = if i + 1 < m
+                         then Word64.<< (limb (i + 1)) (32 - bitShift)
+                         else 0w0
+              in Word64.andb (Word64.orb lo hi) mask32 end))
+        end
+    end
+
+  fun shlBits (v, k) =
+
+    if Vector.length v = 0 then empty
+    else
+      let
+        val limbShift = k div 32
+        val bitShift = k mod 32
+        val n = Vector.length v
+      in
+        if bitShift = 0
+        then normVec (Vector.tabulate (n + limbShift)
+               fn i => if i < limbShift then 0w0 else Vector.sub v (i - limbShift))
+        else
+          normVec (Vector.tabulate (n + limbShift + 1) (fn i =>
+            if i < limbShift then 0w0
+            else
+              let
+                val j = i - limbShift
+                val lo = if j < n then Word64.<< (Vector.sub v j) bitShift else 0w0
+                val hi = if j >= 1 andalso j - 1 < n
+                         then Word64.>> (Vector.sub v (j - 1)) (32 - bitShift)
+                         else 0w0
+              in Word64.andb (Word64.orb lo hi) mask32 end))
+      end
+
+  fun trailingZeros (v) =
+
+    let
+      val n = Vector.length v
+      fun firstNonZero i = if i >= n then ~1
+                           else if not (Word64.= (Vector.sub v i) 0w0) then i
+                           else firstNonZero (i + 1)
+      val fi = firstNonZero 0
+    in
+      if fi < 0 then 0
+      else
+        let
+          val w = Vector.sub v fi
+          fun ctz (w, n) = if Word64.= (Word64.andb w 0w1) 0w1 then n
+                           else ctz (Word64.>> w 1, n + 1)
+        in fi * 32 + ctz (w, 0) end
+    end
+
+  (* Binary long division of magnitudes; b must be non-zero.
+     Returns (quotient, remainder). *)
+  fun magDivMod (a, b) =
+
+    if magIsZero a then (empty, empty)
+    else
+      case magCompare (a, b) of
+          Less => (empty, a)
+        | Equal => (Vector.fromList [0w1], empty)
+        | Greater =>
+            let
+              val nbits = bitLength a
+              val qbits = Array.array nbits False
+              fun loop (i, r) =
+                if i < 0 then r
+                else
+                  let val r1 = magShl1 (r, testBit (a, i))
+                  in
+                    case magCompare (r1, b) of
+                        Less => loop (i - 1, r1)
+                      | _ => (Array.update qbits i True; loop (i - 1, magSub (r1, b)))
+                  end
+              val r = loop (nbits - 1, empty)
+              val nlimbs = (nbits + 31) div 32
+              val qa = Array.array nlimbs (0w0 : limb)
+              fun pack i =
+                if i >= nbits then ()
+                else
+                  ( if Array.sub qbits i
+                    then
+                      let
+                        val li = i div 32
+                        val bi = i mod 32
+                      in
+                        Array.update qa li
+                          (Word64.orb (Array.sub qa li) (Word64.<< 0w1 bi))
+                      end
+                    else ()
+                  ; pack (i + 1) )
+            in
+              pack 0; (normArr qa, r)
+            end
+
+  (* Binary (Stein) GCD on non-zero magnitudes. *)
+  fun magGcd (a, b) =
+
+    let
+      val shift = Int.min (trailingZeros a, trailingZeros b)
+      fun loop (u, v) =
+        let
+          val v2 = shrBits (v, trailingZeros v)
+          val (u2, v3) = if magCompare u v2 = Greater then (v2, u) else (u, v2)
+          val d = magSub (v3, u2)
+        in
+          if magIsZero d then u2 else loop (u2, d)
+        end
+      val u0 = shrBits (a, trailingZeros a)
+    in
+      shlBits (loop (u0, b), shift)
+    end
+
+  (* ===== sign-magnitude layer ===== *)
+
+  datatype bigint = BI of int * mag   (* sign in {~1,0,1}, magnitude *)
+
+  fun mk (sgn, m) = if magIsZero m then BI (0, empty) else BI (sgn, m)
+
+  val zeroB = BI (0, empty)
+  val oneB  = BI (1, Vector.fromList [0w1])
+
+  (* ----- conversions ----- *)
+
+  fun fromInt n =
+    if n = 0 then zeroB
+    else
+      let
+        val sgn = if n < 0 then ~1 else 1
+        (* base-2^16 chunks, most significant first (built by prepending) *)
+        fun chunks (n, acc) =
+          if n = 0 then acc
+          else chunks (n div 65536,
+                       Word64.fromInt (abs (n mod 65536)) :: acc)
+        val hiToLo = chunks (n, [])
+        val loToHi = List.rev hiToLo
+        (* pack pairs of 16-bit chunks into 32-bit limbs *)
+        fun pack (xs, acc) =
+          case xs of
+              [] => List.rev acc
+            | [lo] => List.rev (lo :: acc)
+            | (lo :: hi :: rest) =>
+                pack (rest, Word64.orb lo (Word64.<< hi 16) :: acc)
+        val limbs = pack (loToHi, [])
+      in
+        mk (sgn, normVec (Vector.fromList limbs))
+      end
+
+  (* CakeML int is bignum, so projection never overflows. *)
+  fun toInt (BI (sgn, mag)) =
+    let
+      fun horner (acc, w) =
+        let
+          val lo = Word64.toInt (Word64.andb w 0wxFFFF)
+          val hi = Word64.toInt (Word64.>> w 16)
+        in
+          (acc * 65536 + sgn * hi) * 65536 + sgn * lo
+        end
+      fun loop (i, acc) =
+        if i < 0 then acc else loop (i - 1, horner (acc, Vector.sub mag i))
+    in
+      Some (loop (Vector.length mag - 1, 0))
+    end
+
+  (* ----- comparison / sign / abs ----- *)
+
+  fun compare (BI (sa, ma), BI (sb, mb)) =
+    if sa <> sb then Int.compare sa sb
+    else
+      case sa of
+          0 => Equal
+        | 1 => magCompare (ma, mb)
+        | _ => magCompare (mb, ma)
+
+  fun sign (BI (s, _)) = fromInt s
+  fun absB (BI (s, m)) = if s = 0 then zeroB else BI (1, m)
+  fun negate (BI (s, m)) = BI (~s, m)
+
+  (* ----- additive arithmetic ----- *)
+
+  fun add (BI (sa, ma), BI (sb, mb)) =
+    if sa = 0 then BI (sb, mb)
+    else if sb = 0 then BI (sa, ma)
+    else if sa = sb then mk (sa, magAdd (ma, mb))
+    else
+      case magCompare (ma, mb) of
+          Equal => zeroB
+        | Greater => mk (sa, magSub (ma, mb))
+        | Less => mk (sb, magSub (mb, ma))
+
+  fun sub (a, b) = add (a, negate b)
+
+  fun mul (BI (sa, ma), BI (sb, mb)) =
+    if sa = 0 orelse sb = 0 then zeroB
+    else mk (sa * sb, magMul (ma, mb))
+
+  (* ----- division ----- *)
+
+  fun quotRem (BI (sa, ma), BI (sb, mb)) =
+    if sb = 0 then raise Div
+    else if sa = 0 then (zeroB, zeroB)
+    else
+      let
+        val (q, r) = magDivMod (ma, mb)
+      in
+        (mk (sa * sb, q), mk (sa, r))
+      end
+
+  fun divMod (a as BI (sa, _), b as BI (sb, _)) =
+    if sb = 0 then raise Div
+    else
+      let
+        val (q, r) = quotRem (a, b)
+      in
+        case r of
+            BI (0, _) => (q, r)
+          | _ => if sa = sb then (q, r)
+                 else (sub (q, oneB), add (r, b))
+      end
+
+  (* ----- string output ----- *)
+
+  fun digitChar d =
+    if d < 10 then Char.chr (Char.ord #"0" + d)
+    else Char.chr (Char.ord #"a" + (d - 10))
+
+  fun toStringRadix radix n =
+    let
+      val rI = case toInt radix of Some r => r | None => raise Domain
+      val () = if rI < 2 orelse rI > 36 then raise Domain else ()
+      val BI (sgn, mag) = n
+    in
+      if sgn = 0 then "0"
+      else
+        let
+          val rMag = case radix of BI (_, m) => m
+          fun loop (m, acc) =
+            if magIsZero m then acc
+            else
+              let
+                val (q, r) = magDivMod (m, rMag)
+                val d = case toInt (mk (1, r)) of Some x => x | None => raise Domain
+              in
+                loop (q, digitChar d :: acc)
+              end
+          val digits = loop (mag, [])
+          val body = String.implode digits
+        in
+          if sgn < 0 then "~" ^ body else body
+        end
+    end
+
+  fun toString n = toStringRadix (fromInt 10) n
+
+  (* ----- string input (base 10) ----- *)
+
+  val tenB = fromInt 10
+
+  fun fromString str =
+    let
+      val n = String.size str
+    in
+      if n = 0 then None
+      else
+        let
+          val c0 = String.sub str 0
+          val (neg, start) =
+            if Char.= c0 #"~" orelse Char.= c0 #"-" then (True, 1)
+            else if Char.= c0 #"+" then (False, 1)
+            else (False, 0)
+        in
+          if start >= n then None
+          else
+            let
+              fun loop (i, acc) =
+                if i >= n then Some acc
+                else
+                  let val c = String.sub str i
+                  in
+                    if Char.>= c #"0" andalso Char.<= c #"9"
+                    then loop (i + 1, add (mul (acc, tenB), fromInt (Char.ord c - Char.ord #"0")))
+                    else None
+                  end
+            in
+              case loop (start, zeroB) of
+                  None => None
+                | Some v => Some (if neg then negate v else v)
+            end
+        end
+    end
+
+  (* ----- powers ----- *)
+
+  fun pow (b, e) =
+    let
+      val BI (se, me) = e
+    in
+      if se < 0 then raise Domain
+      else if se = 0 then oneB
+      else
+        let
+          val nbits = bitLength me
+          fun loop (i, acc) =
+            if i < 0 then acc
+            else
+              let val acc2 = mul (acc, acc)
+              in loop (i - 1, if testBit (me, i) then mul (acc2, b) else acc2) end
+        in
+          loop (nbits - 1, oneB)
+        end
+    end
+
+  fun gcd (a, b) =
+    let
+      val BI (sa, ma) = absB a
+      val BI (sb, mb) = absB b
+    in
+      if sa = 0 then absB b
+      else if sb = 0 then absB a
+      else BI (1, magGcd (ma, mb))
+    end
+
+  fun modpow (b, e, m) =
+    let
+      val BI (se, me) = e
+    in
+      if se < 0 then raise Domain
+      else
+        case compare (m, oneB) of
+            Less => raise Div
+          | Equal => zeroB
+          | Greater =>
+              let
+                fun reduce x = let val (_, r) = divMod (x, m) in r end
+                val base0 = reduce b
+                val nbits = bitLength me
+                fun loop (i, acc) =
+                  if i < 0 then acc
+                  else
+                    let val acc2 = reduce (mul (acc, acc))
+                    in loop (i - 1, if testBit (me, i) then reduce (mul (acc2, base0)) else acc2) end
+              in
+                if se = 0 then reduce oneB else loop (nbits - 1, oneB)
+              end
+    end
+
+  (* ----- additive extensions ----- *)
+
+  (* ----- bitwise operations (infinite two's complement) ----- *)
+
+  fun magLimb (m, i) =
+
+    if i < Vector.length m then Vector.sub m i else 0w0
+
+  fun tcView (BI (s, m)) =
+    if s >= 0 then (False, fn i => magLimb (m, i))
+    else
+      let val m1 = magSub (m, oneMag)
+      in (True, fn i => notb (magLimb (m1, i))) end
+
+  fun bitwise opf (a as BI (_, ma), b as BI (_, mb)) =
+    let
+      val (na, fa) = tcView a
+      val (nb, fb) = tcView b
+      val extA : limb = if na then mask32 else 0w0
+      val extB : limb = if nb then mask32 else 0w0
+      val resNeg = Word64.= (opf extA extB) mask32
+      val n = Int.max (Vector.length ma, Vector.length mb) + 1
+      val r = Array.tabulate n (fn i => opf (fa i) (fb i))
+    in
+      if not resNeg then mk (1, normArr r)
+      else
+        let
+          val res = Array.array n (0w0 : limb)
+          fun loop (i, carry) =
+            if i >= n then ()
+            else
+              let val x = Word64.+ (notb (Array.sub r i)) carry
+              in Array.update res i (Word64.andb x mask32); loop (i + 1, Word64.>> x 32) end
+        in
+          loop (0, 0w1); mk (~1, normArr res)
+        end
+    end
+
+  fun andbB (a, b) = bitwise andb (a, b)
+  fun orbB  (a, b) = bitwise orb  (a, b)
+  fun xorbB (a, b) = bitwise xorb (a, b)
+  fun notbB n = negate (add (n, oneB))
+
+  fun shlB (n, k) =
+    if k < 0 then raise Domain
+    else let val BI (s, m) = n in mk (s, shlBits (m, k)) end
+
+  fun shrB (n, k) =
+    if k < 0 then raise Domain
+    else
+      let val BI (s, m) = n
+      in
+        if s >= 0 then mk (s, shrBits (m, k))
+        else
+          let
+            val q = shrBits (m, k)
+            val exact = magCompare (shlBits (q, k), m) = Equal
+          in
+            if exact then mk (~1, q) else mk (~1, magAdd (q, oneMag))
+          end
+      end
+
+  fun bitLengthOf (BI (_, m)) = bitLength m
+
+  fun bitB (n, i) =
+    if i < 0 then raise Domain
+    else
+      let
+        val (_, lf) = tcView n
+        val li = i div 32
+        val bi = i mod 32
+      in
+        Word64.= (Word64.andb (Word64.>> (lf li) bi) 0w1) 0w1
+      end
+
+  fun setBitB (n, i) = orbB (n, shlB (oneB, i))
+  fun clearBitB (n, i) = if bitB (n, i) then xorbB (n, shlB (oneB, i)) else n
+
+  fun popcountB n =
+    let
+      val BI (_, m) = absB n
+      fun limbPop (w, acc) =
+        if Word64.= w 0w0 then acc
+        else limbPop (Word64.>> w 1,
+                      acc + (if Word64.= (Word64.andb w 0w1) 0w1 then 1 else 0))
+      fun loop (i, acc) =
+        if i >= Vector.length m then acc
+        else loop (i + 1, limbPop (Vector.sub m i, acc))
+    in loop (0, 0) end
+
+  (* ----- integer roots ----- *)
+
+  fun isqrtB n =
+    case compare (n, zeroB) of
+        Less => raise Domain
+      | Equal => zeroB
+      | Greater =>
+          let
+            val bl = bitLengthOf n
+            val x0 = shlB (oneB, (bl + 1) div 2)
+            fun loop x =
+              let val (q1, _) = divMod (n, x)
+                  val (s, _) = divMod (add (x, q1)) (fromInt 2)
+              in if compare s x = Less then loop s else x end
+          in loop x0 end
+
+  fun nthRootB (k, n) =
+    if k < 1 then raise Domain
+    else if compare n zeroB = Less then raise Domain
+    else if k = 1 then n
+    else if compare n zeroB = Equal then zeroB
+    else if k = 2 then isqrtB n
+    else
+      let
+        val kB = fromInt k
+        val km1 = fromInt (k - 1)
+        val bl = bitLengthOf n
+        val x0 = shlB (oneB, (bl + k - 1) div k + 1)
+        fun newton x =
+          let
+            val xk1 = pow (x, km1)
+            val (q1, _) = divMod (n, xk1)
+            val (s, _) = divMod (add (mul (km1, x), q1)) kB
+          in if compare s x = Less then newton s else x end
+        val approx = newton x0
+        fun down x = if compare (pow (x, kB)) n = Greater then down (sub (x, oneB)) else x
+        val x1 = down approx
+        fun up x = if compare (pow (add (x, oneB), kB)) n <> Greater then up (add (x, oneB)) else x
+      in up x1 end
+
+  (* ----- byte serialization (big-endian, unsigned magnitude) ----- *)
+
+  fun toBytesB n =
+    let
+      val BI (_, m) = absB n
+      val nbits = bitLength m
+    in
+      if nbits = 0 then ""
+      else
+        let
+          val nbytes = (nbits + 7) div 8
+          fun byteAt j =
+            let
+              val idx = nbytes - 1 - j
+              val limbIdx = idx div 4
+              val shift = (idx mod 4) * 8
+              val w = magLimb (m, limbIdx)
+              val b = Word64.andb (Word64.>> w shift) 0wxFF
+            in Char.chr (Word64.toInt b) end
+        in
+          String.implode (List.tabulate nbytes byteAt)
+        end
+    end
+
+  fun fromBytesB s =
+    let
+      val n = String.size s
+      fun loop (i, acc) =
+        if i >= n then acc
+        else loop (i + 1, add (shlB (acc, 8), fromInt (Char.ord (String.sub s i))))
+    in loop (0, zeroB) end
+
+  (* ----- public names ----- *)
+
+  type int = bigint
+
+  val isqrt = isqrtB
+  val sqrt = isqrtB
+  val nthRoot = nthRootB
+  val andb = andbB
+  val orb = orbB
+  val xorb = xorbB
+  val notb = notbB
+  val shl = shlB
+  val shr = shrB
+  val bit = bitB
+  val testBit = bitB
+  val setBit = setBitB
+  val clearBit = clearBitB
+  val popcount = popcountB
+  val bitLength = bitLengthOf
+  val toBytes = toBytesB
+  val fromBytes = fromBytesB
+end
+
+(* ---------- test driver ---------- *)
+
+fun check (name, got, expected) =
+  if String.= got expected then
+    print ("PASS " ^ name ^ "\n  " ^ got ^ "\n")
+  else
+    print ("FAIL " ^ name ^ "\n  expected: " ^ expected ^ "\n  got:      " ^ got ^ "\n");
+
+fun chkInt (name, v, expected) =
+  check (name, BigInt.toString v, expected);
+
+(* fromInt / toString basics *)
+val _ = chkInt ("zero", BigInt.fromInt 0, "0");
+val _ = chkInt ("one", BigInt.fromInt 1, "1");
+val _ = chkInt ("neg-one", BigInt.fromInt ~1, "~1");
+val _ = chkInt ("12345", BigInt.fromInt 12345, "12345");
+val _ = chkInt ("neg-12345", BigInt.fromInt ~12345, "~12345");
+
+(* fromString *)
+val _ = case BigInt.fromString "123456789012345678901234567890" of
+          Some v => chkInt ("fromString big", v, "123456789012345678901234567890")
+        | None => print "FAIL fromString big\n";
+val _ = case BigInt.fromString "~987654321" of
+          Some v => chkInt ("fromString neg", v, "~987654321")
+        | None => print "FAIL fromString neg\n";
+
+(* add / sub / mul on big values *)
+val a = Option.valOf (BigInt.fromString "123456789012345678901234567890");
+val b = Option.valOf (BigInt.fromString "987654321098765432109876543210");
+val _ = chkInt ("add", BigInt.add (a, b), "1111111110111111111011111111100");
+val _ = chkInt ("sub", BigInt.sub (b, a), "864199532086419753208641975320");
+val _ = chkInt ("mul", BigInt.mul (a, b),
+  "121932631137021795226185032733622923332237463801111263526900");
+
+(* divMod *)
+val d = BigInt.fromInt 1000000;
+val (q, r) = BigInt.divMod (a, d);
+val _ = chkInt ("divMod q", q, "123456789012345678901234");
+val _ = chkInt ("divMod r", r, "567890");
+
+(* compare *)
+val _ = if BigInt.compare (a, b) = Less then print "PASS compare a<b\n"
+        else print "FAIL compare a<b\n";
+val _ = if BigInt.compare (b, a) = Greater then print "PASS compare b>a\n"
+        else print "FAIL compare b>a\n";
+val _ = if BigInt.compare (a, a) = Equal then print "PASS compare a=a\n"
+        else print "FAIL compare a=a\n";
+
+(* pow *)
+val _ = chkInt ("pow 2^64", BigInt.pow (BigInt.fromInt 2, BigInt.fromInt 64),
+  "18446744073709551616");
+
+(* gcd *)
+val g1 = BigInt.fromInt 48;
+val g2 = BigInt.fromInt 36;
+val _ = chkInt ("gcd 48 36", BigInt.gcd (g1, g2), "12");
+
+(* isqrt *)
+val _ = chkInt ("isqrt 99", BigInt.isqrt (BigInt.fromInt 99), "9");
+val _ = chkInt ("isqrt 100", BigInt.isqrt (BigInt.fromInt 100), "10");
+val _ = chkInt ("isqrt 101", BigInt.isqrt (BigInt.fromInt 101), "10");
+
+(* modpow: 2^100 mod 1000000007 *)
+val mp = BigInt.modpow (BigInt.fromInt 2, BigInt.fromInt 100, BigInt.fromInt 1000000007);
+val _ = chkInt ("modpow 2^100 mod 1e9+7", mp, "976371285");
+
+(* toInt roundtrip *)
+val _ = case BigInt.toInt (BigInt.fromInt 42) of
+          Some n => if n = 42 then print "PASS toInt 42\n" else print "FAIL toInt 42\n"
+        | None => print "FAIL toInt 42 None\n";
+
+val _ = print "DONE\n";

@@ -22,6 +22,13 @@ sig
   (* Initialise a fresh read/write direction from traffic key + IV. *)
   val init : {key : string, iv : string} -> state
 
+  (* Initialise with an explicit AEAD algorithm. The J1 integrator uses
+     this to thread the negotiated cipher suite through to record
+     protection, so that AES-256-GCM (0x1302) is distinguished from
+     ChaCha20-Poly1305 (0x1303) -- both have 32-byte keys, so the
+     key-length inference in `init` cannot tell them apart. *)
+  val initWithAlg : {key : string, iv : string, alg : Aead.alg} -> state
+
   (* Per-record nonce = static IV XOR big-endian seq, left-padded to
      `Aead.nonceLen` (RFC 8446 §5.3). *)
   val nonce : {iv : string, seq : int} -> string

@@ -34,6 +34,9 @@ struct
   fun init {key, iv} : state =
     {key = key, iv = iv, alg = algForKey key, seq = 0}
 
+  fun initWithAlg {key, iv, alg} : state =
+    {key = key, iv = iv, alg = alg, seq = 0}
+
   (* The 64-bit sequence number as a big-endian 8-byte string, then
      left-padded with zeros to `Aead.nonceLen` (12) bytes. RFC 8446 §5.3:
      "The 64-bit record sequence number is encoded in network byte order
