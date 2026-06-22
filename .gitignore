@@ -11,3 +11,5 @@
 # Editor / OS noise
 .DS_Store
 *~
+proof/.hol/
+*.dumpedheap
