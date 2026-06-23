@@ -50,30 +50,58 @@ Round-trip theorems `decode (encode x) = SOME (x, …)`:
 | `decode_encode_extensions` | **proved (bound)** | each `LENGTH data < 2^16` and total block `< 2^16` |
 | `finished_roundtrip` | **proved (bound)** | `verifyData <> []` (matches SML, which rejects empty) |
 | `certificateVerify_roundtrip` | **proved (bound)** | `LENGTH sigBytes < 2^16` |
+| `decode_encode_newSessionTicket` | **proved (bound)** | `wfNewSessionTicket` (see below) |
+| `decode_encode_certificate` | **proved (bound)** | `wfCertificate` (see below) |
+| `decode_encode_serverHello` | **proved (bound)** | `wfServerHello` (see below) |
+| `decode_encode_clientHello` | **proved (bound)** | `wfClientHello` (see below) |
 
 The length side conditions are genuine: a 2-byte (resp. 3-byte) length field
 cannot represent a value `>= 2^16` (resp. `2^24`), so the round-trip can only
 hold under the bound. These are not weaknesses of the proof; they are facts
 about the format. (TLS itself bounds records below `2^14`.)
 
-### Not modeled: `clientHello`, `serverHello`, `certificate`, `newSessionTicket`
+### Now modeled: `newSessionTicket`, `certificate`, `serverHello`, `clientHello`
 
-The datatypes are declared (documenting the intended model), but their
-encoders/decoders and round-trip theorems are **not modeled in HOL4**. These
-structures carry nested, length-prefixed *lists* of sub-structures (cipher-
-suite lists, an optional trailing extension block, a list of `CertificateEntry`
-each with its own 3-byte length prefix). In the SML (`tls.sml`) the
-encoder/decoder pair is **not a clean inverse** in all cases (e.g. an absent
-trailing extension block decodes back to `[]`), so an unconditional round-trip
-theorem is simply false without extra well-formedness conditions.
+All four structures are now fully modeled with `encode<X>_def` / `decode<X>_def`
+mirroring the SML (`tls.sml`) field order and framing, a well-formedness
+predicate `wf<X>` capturing the on-the-wire length bounds, and a **proved**
+round-trip `wf<X> x ==> decode<X> (encode<X> x) = SOME x` (no `cheat`, no
+oracle beyond `DISK_THM`).
 
-These previously had `cheat`-ed round-trip "theorems". Those were **removed**:
-because the placeholder encoders returned `[]` and decoders returned `NONE`,
-the stated goals (`decode (encode x) = SOME x`) were *false*, and a `cheat` on
-a false goal makes the whole theory logically inconsistent. Removing them and
-recording the gap here keeps `tls_wireTheory` sound. Mechanizing these codecs
-(remainder-passing combinators + list-loop lemmas, building on the proved
-framing layer above) is tracked open work.
+The nested length-prefixed lists are handled by generic combinators with their
+own proved loop-correctness lemmas, layered on the existing framing lemmas:
+
+* `decodeW16s_loop_correct` — parses a length-prefixed list of `word16`
+  (cipher-suite list) back to the original list.
+* `encodeW16ListBody_length` — the encoded suite body is `2 * LENGTH suites`.
+* `decodeExtensionsR_correct` — a remainder-passing extension-block decoder
+  (returns `(exts, rest)`), used inside the per-entry certificate loop.
+* `decodeCertEntries_loop_correct` — parses the concatenation of encoded
+  `CertificateEntry`s (each with its own 3-byte length prefix and nested
+  extension block) back to the original list.
+
+The exact well-formedness side conditions are:
+
+* **`wfNewSessionTicket t`**: `LENGTH ticketNonce < 2^8`, `LENGTH ticket < 2^24`,
+  each extension's `LENGTH data < 2^16`, and the encoded extension block
+  `< 2^16`.
+* **`wfCertificate c`**: `LENGTH certificateRequestContext < 2^8`,
+  `LENGTH (encodeCertEntries certificateList) < 2^24`, and per entry:
+  `LENGTH certData < 2^24`, each extension's `LENGTH data < 2^16`, and the
+  encoded extension block `< 2^16`.
+* **`wfServerHello sh`**: `LENGTH random = 32`, `LENGTH legacySessionId < 2^8`,
+  each extension's `LENGTH data < 2^16`, and the encoded extension block
+  `< 2^16`.
+* **`wfClientHello ch`**: `LENGTH random = 32`, `LENGTH legacySessionId < 2^8`,
+  `LENGTH cipherSuites < 2^15` (so the 2-byte byte-count `2*n` stays `< 2^16`),
+  `LENGTH legacyCompression < 2^8`, each extension's `LENGTH data < 2^16`, and
+  the encoded extension block `< 2^16`.
+
+These bounds are genuine consequences of the wire length fields (1-, 2-, and
+3-byte length prefixes), exactly in the honest-bound style of the simpler
+codecs above. The HOL4 decoders always parse the trailing extension block via
+`decodeExtensions` (matching the always-present length-prefixed block the
+encoders emit), so the round-trip holds unconditionally given `wf<X>`.
 
 ---
 
@@ -194,8 +222,10 @@ There is **no mechanized refinement proof** linking the HOL4 spec to the SML
   with `tls.sml` **by manual inspection** of field order and framing. They are
   not proved equal to the SML functions, and there is no CakeML
   translator/extraction theorem connecting either to running code.
-* `clientHello` / `serverHello` / `certificate` / `newSessionTicket` codecs
-  exist in the SML but are **not modeled** in HOL4.
+* `clientHello` / `serverHello` / `certificate` / `newSessionTicket` codecs are
+  now modeled in HOL4 with proved round-trips (under `wf<X>` bounds), but they
+  are still an *independent re-modeling* aligned with `tls.sml` by inspection —
+  not proved equal to the SML functions.
 * The key schedule matches the RFC *structurally*; it is not validated against
   the RFC 8448 byte vectors (needs concrete crypto), and is not proved to match
   the SML `TlsKeySchedule` module.

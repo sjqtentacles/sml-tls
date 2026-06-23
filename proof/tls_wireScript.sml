@@ -591,22 +591,586 @@ Proof
   simp[TAKE_LENGTH_ID, fetch "-" "certificateVerify_component_equality"]
 QED
 
-(* --- ClientHello / ServerHello / Certificate / NewSessionTicket --------
+(* --------------------------------------------------------------------------
+    Reusable framing helpers for the composite handshake bodies
 
-   These structures carry nested, length-prefixed vectors and *lists* of
-   sub-structures (cipher-suite lists, an extension block whose presence is
-   optional, and -- for Certificate -- a list of CertificateEntry each with
-   its own 3-byte length prefix and extension block).  Their SML encoders /
-   decoders in tls.sml are NOT clean inverses in all cases (e.g. an absent
-   trailing extension block decodes to []), so an unconditional round-trip
-   theorem does not hold without additional well-formedness side conditions.
+    ClientHello / ServerHello / Certificate / NewSessionTicket carry nested,
+    length-prefixed vectors plus a trailing extension block.  We build the
+    codecs out of small, individually-proved pieces:
 
-   To keep this theory SOUND we do NOT state placeholder `cheat` round-trip
-   theorems for them (a `cheat` on a non-theorem would make tls_wireTheory
-   inconsistent).  The datatypes above record the intended model; the
-   mechanized codecs and their conditional round-trip proofs are tracked as
-   open work in proof/PROOF_STATUS.md.  The reusable framing layer needed to
-   discharge them (the record/handshake/extension round-trips above) is
-   fully proved. *)
+      * `encodeOpaque8`  : a 1-byte length-prefixed opaque byte string
+                           (legacy_session_id, certificate_request_context,
+                           ticket_nonce, ClientHello.legacy_compression).
+      * `encodeW16List`  : a 2-byte length-prefixed list of `word16` (the
+                           cipher-suite list of a ClientHello).
+      * `decodeCertEntries_loop` : the inner list-of-CertificateEntry parser,
+                           with a loop-correctness lemma analogous to
+                           `decodeExts_loop_correct`.
+
+    Every round-trip below carries the honest length side conditions the wire
+    length fields impose (the same `(bound)` style as the framing layer above).
+   -------------------------------------------------------------------------- *)
+
+(* w32_to_bytes / w32_of_bytes : big-endian 4-byte integers (ticket lifetime
+   and age-add).  Mirrors `word32ToBytes`/`bytesToWord32` in tls.sml. *)
+Definition w32_to_bytes_def:
+  w32_to_bytes (w : word32) : word8 list =
+    [w2w (w >>> 24); w2w (w >>> 16); w2w (w >>> 8); w2w w]
+End
+
+Definition w32_of_bytes_def:
+  w32_of_bytes (a:word8) (b:word8) (c:word8) (d:word8) : word32 =
+    (w2w a << 24) || (w2w b << 16) || (w2w c << 8) || w2w d
+End
+
+Theorem w32_of_to_bytes:
+  !w:word32. w32_of_bytes (w2w (w >>> 24)) (w2w (w >>> 16))
+                          (w2w (w >>> 8)) (w2w w) = w
+Proof
+  rw[w32_of_bytes_def] >> blastLib.BBLAST_TAC
+QED
+
+(* --- 1-byte length-prefixed opaque string --------------------------------- *)
+
+Definition encodeOpaque8_def:
+  encodeOpaque8 (bs : word8 list) : word8 list =
+    n2w (LENGTH bs) :: bs
+End
+
+(* --- 2-byte length-prefixed word16 list (cipher suites) ------------------- *)
+
+Definition encodeW16ListBody_def:
+  encodeW16ListBody (ws : word16 list) : word8 list =
+    FLAT (MAP w16_to_bytes ws)
+End
+
+Definition encodeW16List_def:
+  encodeW16List (ws : word16 list) : word8 list =
+    w16_to_bytes (n2w (LENGTH (encodeW16ListBody ws)) : word16) ++
+    encodeW16ListBody ws
+End
+
+(* Parse exactly `k` word16s from the front of a byte list (k is the count,
+   derived from the 2-byte length / 2).  Returns the list and the remainder. *)
+Definition decodeW16s_loop_def:
+  (decodeW16s_loop 0 bs = SOME ([], bs)) /\
+  (decodeW16s_loop (SUC k) [] = NONE) /\
+  (decodeW16s_loop (SUC k) [_] = NONE) /\
+  (decodeW16s_loop (SUC k) (h0::h1::rest) =
+     case decodeW16s_loop k rest of
+       | NONE => NONE
+       | SOME (ws, rem) => SOME (w16_of_bytes h0 h1 :: ws, rem))
+End
+
+Theorem decodeW16s_loop_correct:
+  !ws rest.
+    decodeW16s_loop (LENGTH ws) (FLAT (MAP w16_to_bytes ws) ++ rest) =
+      SOME (ws, rest)
+Proof
+  Induct
+  >- simp[decodeW16s_loop_def]
+  >> rpt strip_tac
+  >> simp[w16_to_bytes_def, decodeW16s_loop_def, w16_of_to_bytes]
+QED
+
+(* Each encoded word16 occupies exactly two bytes, so the body length is
+   twice the suite count. *)
+Theorem encodeW16ListBody_length:
+  !ws. LENGTH (encodeW16ListBody ws) = 2 * LENGTH ws
+Proof
+  simp[encodeW16ListBody_def] >>
+  Induct >> simp[w16_to_bytes_def, arithmeticTheory.MULT_CLAUSES]
+QED
+
+(* --- NewSessionTicket (RFC 8446 4.6.1) -----------------------------------
+
+   Wire form (mirrors `encodeNewSessionTicket` in tls.sml):
+     [lifetime:4][ageAdd:4][nonceLen:1][nonce][ticketLen:3][ticket][exts].
+   The trailing extension block is always present (>= 2 bytes) so the SML
+   decoder's "no trailing bytes => extensions = []" branch is never taken on
+   our encoded output. *)
+
+Definition encodeNewSessionTicket_def:
+  encodeNewSessionTicket (t : newSessionTicket) : word8 list =
+    w32_to_bytes t.ticketLifetime ++
+    w32_to_bytes t.ticketAgeAdd ++
+    encodeOpaque8 t.ticketNonce ++
+    len3 (LENGTH t.ticket) ++ t.ticket ++
+    encodeExtensions t.extensions
+End
+
+Definition decodeNewSessionTicket_def:
+  decodeNewSessionTicket (bs : word8 list) : newSessionTicket option =
+    if LENGTH bs < 9 then NONE
+    else
+      let lifetime = w32_of_bytes (EL 0 bs) (EL 1 bs) (EL 2 bs) (EL 3 bs) in
+      let ageAdd   = w32_of_bytes (EL 4 bs) (EL 5 bs) (EL 6 bs) (EL 7 bs) in
+      let nonceLen = w2n (EL 8 bs) in
+      let r1       = DROP 9 bs in
+      if LENGTH r1 < nonceLen then NONE
+      else
+        let nonce = TAKE nonceLen r1 in
+        let r2    = DROP nonceLen r1 in
+        if LENGTH r2 < 3 then NONE
+        else
+          let tlen = w2n (w24_of_len3 (EL 0 r2) (EL 1 r2) (EL 2 r2)) in
+          let r3   = DROP 3 r2 in
+          if LENGTH r3 < tlen then NONE
+          else
+            let ticket = TAKE tlen r3 in
+            let r4     = DROP tlen r3 in
+            case decodeExtensions r4 of
+              | NONE => NONE
+              | SOME exts =>
+                  SOME <| ticketLifetime := lifetime;
+                          ticketAgeAdd   := ageAdd;
+                          ticketNonce    := nonce;
+                          ticket         := ticket;
+                          extensions     := exts |>
+End
+
+Definition wfNewSessionTicket_def:
+  wfNewSessionTicket (t : newSessionTicket) <=>
+    LENGTH t.ticketNonce < 256 /\
+    LENGTH t.ticket < 16777216 /\
+    EVERY (\e. LENGTH e.data < 65536) t.extensions /\
+    LENGTH (FLAT (MAP encodeExtension t.extensions)) < 65536
+End
+
+Theorem decode_encode_newSessionTicket:
+  !t. wfNewSessionTicket t ==>
+      decodeNewSessionTicket (encodeNewSessionTicket t) = SOME t
+Proof
+  rw[wfNewSessionTicket_def] >>
+  `encodeNewSessionTicket t =
+     w2w (t.ticketLifetime >>> 24) :: w2w (t.ticketLifetime >>> 16) ::
+     w2w (t.ticketLifetime >>> 8) :: w2w t.ticketLifetime ::
+     w2w (t.ticketAgeAdd >>> 24) :: w2w (t.ticketAgeAdd >>> 16) ::
+     w2w (t.ticketAgeAdd >>> 8) :: w2w t.ticketAgeAdd ::
+     n2w (LENGTH t.ticketNonce) ::
+     (t.ticketNonce ++
+      (n2w ((LENGTH t.ticket DIV 65536) MOD 256) ::
+       n2w ((LENGTH t.ticket DIV 256) MOD 256) ::
+       n2w (LENGTH t.ticket MOD 256) ::
+       (t.ticket ++ encodeExtensions t.extensions)))`
+    by simp[encodeNewSessionTicket_def, w32_to_bytes_def, encodeOpaque8_def,
+            len3_def] >>
+  simp[decodeNewSessionTicket_def] >>
+  simp[w32_of_to_bytes] >>
+  `(n2w (LENGTH t.ticketNonce) : word8) = n2w (LENGTH t.ticketNonce)` by simp[] >>
+  simp[w2n_n2w] >>
+  `LENGTH t.ticketNonce MOD dimword (:8) = LENGTH t.ticketNonce`
+    by (`dimword (:8) = 256` by EVAL_TAC >> simp[]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[len3_w24_roundtrip] >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[decode_encode_extensions] >>
+  simp[fetch "-" "newSessionTicket_component_equality"]
+QED
+
+(* --- Certificate (RFC 8446 4.4.2) ----------------------------------------
+
+   Wire form (mirrors `encodeCertificate` in tls.sml):
+     [ctxLen:1][ctx][entriesTotalLen:3][entries]
+   where each entry is
+     [certDataLen:3][certData][extensions block].
+
+   The inner entry parser needs to know how far each entry extends; the
+   extension block is self-describing (its 2-byte length header), so we use a
+   *remainder-passing* extension decoder `decodeExtensionsR`, then a
+   `decodeCertEntries_loop` analogous to `decodeExts_loop`. *)
+
+(* Remainder-passing extension-block decoder: like `decodeExtensions` but
+   returns the bytes following the 2 + total-byte block. *)
+Definition decodeExtensionsR_def:
+  decodeExtensionsR (bs : word8 list) : (extension list # word8 list) option =
+    if LENGTH bs < 2 then NONE
+    else
+      let total = w2n (w16_of_bytes (EL 0 bs) (EL 1 bs)) in
+      if LENGTH bs < 2 + total then NONE
+      else
+        case decodeExts_loop (TAKE total (DROP 2 bs)) [] of
+          | NONE => NONE
+          | SOME es => SOME (es, DROP (2 + total) bs)
+End
+
+Theorem decodeExtensionsR_correct:
+  !es rest.
+    EVERY (\e. LENGTH e.data < 65536) es /\
+    LENGTH (FLAT (MAP encodeExtension es)) < 65536 ==>
+    decodeExtensionsR (encodeExtensions es ++ rest) = SOME (es, rest)
+Proof
+  rpt strip_tac >>
+  simp[decodeExtensionsR_def, encodeExtensions_def, w16_to_bytes_def] >>
+  simp[w16_of_to_bytes, w16_len_roundtrip, rich_listTheory.TAKE_LENGTH_APPEND,
+       rich_listTheory.DROP_LENGTH_APPEND] >>
+  simp[GSYM rich_listTheory.APPEND_ASSOC] >>
+  simp[w16_of_to_bytes, w16_len_roundtrip, rich_listTheory.TAKE_LENGTH_APPEND,
+       rich_listTheory.DROP_LENGTH_APPEND] >>
+  simp[decodeExts_loop_correct]
+QED
+
+Definition encodeCertEntry_def:
+  encodeCertEntry (e : certificateEntry) : word8 list =
+    len3 (LENGTH e.certData) ++ e.certData ++ encodeExtensions e.extensions
+End
+
+Definition encodeCertEntries_def:
+  encodeCertEntries (es : certificateEntry list) : word8 list =
+    FLAT (MAP encodeCertEntry es)
+End
+
+(* Loop over the (already length-delimited) entries block.  Each iteration
+   reads a 3-byte certData length, the cert data, then a self-describing
+   extension block.  An empty input ends the list. *)
+Definition decodeCertEntries_loop_def:
+  decodeCertEntries_loop (bs : word8 list) acc =
+    if bs = [] then SOME (REVERSE acc)
+    else if LENGTH bs < 3 then NONE
+    else
+      let n  = w2n (w24_of_len3 (EL 0 bs) (EL 1 bs) (EL 2 bs)) in
+      let r1 = DROP 3 bs in
+      if LENGTH r1 < n then NONE
+      else
+        let cd = TAKE n r1 in
+        let r2 = DROP n r1 in
+        case decodeExtensionsR r2 of
+          | NONE => NONE
+          | SOME (es, r3) =>
+              decodeCertEntries_loop r3
+                (<| certData := cd; extensions := es |> :: acc)
+Termination
+  WF_REL_TAC `measure (LENGTH o FST)` >> rw[] >>
+  imp_res_tac (Q.prove(
+    `!bs es r. decodeExtensionsR bs = SOME (es, r) ==> LENGTH r <= LENGTH bs`,
+    rw[decodeExtensionsR_def] >> gvs[AllCaseEqs()] >> simp[LENGTH_DROP])) >>
+  `LENGTH (DROP n (DROP 3 bs)) <= LENGTH (DROP 3 bs)` by simp[LENGTH_DROP] >>
+  `LENGTH (DROP 3 bs) < LENGTH bs` by
+     (Cases_on `bs` >> fs[] >> simp[LENGTH_DROP]) >>
+  fs[]
+End
+
+(* Loop correctness: parsing the concatenation of encoded entries recovers
+   them in order, given each entry's certData fits in 3 bytes and its
+   extensions fit the 2-byte fields. *)
+Theorem decodeCertEntries_loop_correct:
+  !es acc.
+    EVERY (\e. LENGTH e.certData < 16777216 /\
+               EVERY (\x. LENGTH x.data < 65536) e.extensions /\
+               LENGTH (FLAT (MAP encodeExtension e.extensions)) < 65536) es ==>
+    decodeCertEntries_loop (FLAT (MAP encodeCertEntry es)) acc =
+      SOME (REVERSE acc ++ es)
+Proof
+  Induct
+  >- simp[Once decodeCertEntries_loop_def]
+  >> rpt strip_tac
+  >> fs[]
+  >> simp[encodeCertEntry_def, len3_def]
+  >> simp[Once decodeCertEntries_loop_def]
+  >> `w2n (w24_of_len3 (n2w (LENGTH h.certData DIV 65536 MOD 256))
+                       (n2w (LENGTH h.certData DIV 256 MOD 256))
+                       (n2w (LENGTH h.certData MOD 256))) = LENGTH h.certData`
+       by simp[len3_w24_roundtrip]
+  >> asm_simp_tac bool_ss []
+  >> PURE_REWRITE_TAC[GSYM APPEND_ASSOC]
+  >> PURE_REWRITE_TAC[rich_listTheory.DROP_LENGTH_APPEND,
+                      rich_listTheory.TAKE_LENGTH_APPEND]
+  >> `decodeExtensionsR
+        (encodeExtensions h.extensions ++ FLAT (MAP encodeCertEntry es)) =
+        SOME (h.extensions, FLAT (MAP encodeCertEntry es))`
+       by (irule decodeExtensionsR_correct >> fs[])
+  >> asm_simp_tac bool_ss []
+  >> simp[]
+  >> simp[fetch "-" "certificateEntry_component_equality"]
+QED
+
+Definition encodeCertificate_def:
+  encodeCertificate (c : certificate) : word8 list =
+    encodeOpaque8 c.certificateRequestContext ++
+    (let entries = encodeCertEntries c.certificateList in
+       len3 (LENGTH entries) ++ entries)
+End
+
+Definition decodeCertificate_def:
+  decodeCertificate (bs : word8 list) : certificate option =
+    if LENGTH bs < 1 then NONE
+    else
+      let ctxLen = w2n (EL 0 bs) in
+      let r1 = DROP 1 bs in
+      if LENGTH r1 < ctxLen then NONE
+      else
+        let ctx = TAKE ctxLen r1 in
+        let r2  = DROP ctxLen r1 in
+        if LENGTH r2 < 3 then NONE
+        else
+          let total = w2n (w24_of_len3 (EL 0 r2) (EL 1 r2) (EL 2 r2)) in
+          let r3    = DROP 3 r2 in
+          if LENGTH r3 < total then NONE
+          else
+            case decodeCertEntries_loop (TAKE total r3) [] of
+              | NONE => NONE
+              | SOME entries =>
+                  SOME <| certificateRequestContext := ctx;
+                          certificateList := entries |>
+End
+
+Definition wfCertificate_def:
+  wfCertificate (c : certificate) <=>
+    LENGTH c.certificateRequestContext < 256 /\
+    LENGTH (encodeCertEntries c.certificateList) < 16777216 /\
+    EVERY (\e. LENGTH e.certData < 16777216 /\
+               EVERY (\x. LENGTH x.data < 65536) e.extensions /\
+               LENGTH (FLAT (MAP encodeExtension e.extensions)) < 65536)
+          c.certificateList
+End
+
+Theorem decode_encode_certificate:
+  !c. wfCertificate c ==>
+      decodeCertificate (encodeCertificate c) = SOME c
+Proof
+  rw[wfCertificate_def] >>
+  `encodeCertificate c =
+     n2w (LENGTH c.certificateRequestContext) ::
+     (c.certificateRequestContext ++
+      (n2w ((LENGTH (encodeCertEntries c.certificateList) DIV 65536) MOD 256) ::
+       n2w ((LENGTH (encodeCertEntries c.certificateList) DIV 256) MOD 256) ::
+       n2w (LENGTH (encodeCertEntries c.certificateList) MOD 256) ::
+       encodeCertEntries c.certificateList))`
+    by simp[encodeCertificate_def, encodeOpaque8_def, len3_def] >>
+  simp[decodeCertificate_def] >>
+  `(n2w (LENGTH c.certificateRequestContext) : word8) =
+     n2w (LENGTH c.certificateRequestContext)` by simp[] >>
+  simp[w2n_n2w] >>
+  `LENGTH c.certificateRequestContext MOD dimword (:8) =
+     LENGTH c.certificateRequestContext`
+    by (`dimword (:8) = 256` by EVAL_TAC >> simp[]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[GSYM rich_listTheory.APPEND_ASSOC] >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[len3_w24_roundtrip] >>
+  simp[rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `decodeCertEntries_loop (encodeCertEntries c.certificateList) [] =
+     SOME c.certificateList`
+    by (simp[encodeCertEntries_def] >>
+        qspecl_then [`c.certificateList`, `[]`] mp_tac
+          decodeCertEntries_loop_correct >>
+        impl_tac >- fs[] >> simp[]) >>
+  simp[fetch "-" "certificate_component_equality"]
+QED
+
+(* -------------------------------------------------------------------------- *)
+(*  ServerHello (§4.1.3)                                                      *)
+(*                                                                            *)
+(*  Wire: version(2) ++ random(32) ++ sidLen(1) ++ sid ++ cipherSuite(2) ++   *)
+(*        compression(1) ++ encodeExtensions extensions                       *)
+(* -------------------------------------------------------------------------- *)
+
+Definition encodeServerHello_def:
+  encodeServerHello (sh : serverHello) : word8 list =
+    w16_to_bytes sh.legacyVersion ++
+    sh.random ++
+    (n2w (LENGTH sh.legacySessionId) :: sh.legacySessionId) ++
+    w16_to_bytes sh.cipherSuite ++
+    [sh.legacyCompression] ++
+    encodeExtensions sh.extensions
+End
+
+Definition decodeServerHello_def:
+  decodeServerHello (bs : word8 list) : serverHello option =
+    if LENGTH bs < 2 then NONE
+    else
+      let legacyVersion = w16_of_bytes (EL 0 bs) (EL 1 bs) in
+      let a1 = DROP 2 bs in
+      if LENGTH a1 < 32 then NONE
+      else
+        let random = TAKE 32 a1 in
+        let a2 = DROP 32 a1 in
+        if LENGTH a2 < 1 then NONE
+        else
+          let sidLen = w2n (EL 0 a2) in
+          let r1 = DROP 1 a2 in
+          if LENGTH r1 < sidLen then NONE
+          else
+            let sid = TAKE sidLen r1 in
+            let r2  = DROP sidLen r1 in
+            if LENGTH r2 < 3 then NONE
+            else
+              let cipherSuite = w16_of_bytes (EL 0 r2) (EL 1 r2) in
+              let comp = EL 2 r2 in
+              let r3   = DROP 3 r2 in
+              case decodeExtensions r3 of
+                | NONE => NONE
+                | SOME exts =>
+                    SOME <| legacyVersion     := legacyVersion;
+                            random            := random;
+                            legacySessionId   := sid;
+                            cipherSuite       := cipherSuite;
+                            legacyCompression := comp;
+                            extensions        := exts |>
+End
+
+Definition wfServerHello_def:
+  wfServerHello (sh : serverHello) <=>
+    LENGTH sh.random = 32 /\
+    LENGTH sh.legacySessionId < 256 /\
+    EVERY (\e. LENGTH e.data < 65536) sh.extensions /\
+    LENGTH (FLAT (MAP encodeExtension sh.extensions)) < 65536
+End
+
+Theorem decode_encode_serverHello:
+  !sh. wfServerHello sh ==>
+       decodeServerHello (encodeServerHello sh) = SOME sh
+Proof
+  rw[wfServerHello_def] >>
+  `encodeServerHello sh =
+     w8_of_w16_hi sh.legacyVersion :: w8_of_w16_lo sh.legacyVersion ::
+     (sh.random ++
+      (n2w (LENGTH sh.legacySessionId) ::
+       (sh.legacySessionId ++
+        (w8_of_w16_hi sh.cipherSuite :: w8_of_w16_lo sh.cipherSuite ::
+         sh.legacyCompression ::
+         encodeExtensions sh.extensions))))`
+    by simp[encodeServerHello_def, w16_to_bytes_def] >>
+  simp[decodeServerHello_def] >>
+  simp[w16_of_to_bytes] >>
+  qpat_x_assum `LENGTH sh.random = 32`
+    (fn th => PURE_REWRITE_TAC[GSYM th]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `LENGTH sh.legacySessionId MOD dimword (:8) = LENGTH sh.legacySessionId`
+    by (`dimword (:8) = 256` by EVAL_TAC >> simp[]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[w16_of_to_bytes] >>
+  simp[decode_encode_extensions] >>
+  simp[fetch "-" "serverHello_component_equality"]
+QED
+
+(* -------------------------------------------------------------------------- *)
+(*  ClientHello (§4.1.2)                                                      *)
+(*                                                                            *)
+(*  Wire: version(2) ++ random(32) ++ sidLen(1) ++ sid ++                     *)
+(*        cipherSuitesLen(2) ++ FLAT(map w16 cipherSuites) ++                 *)
+(*        compLen(1) ++ legacyCompression ++ encodeExtensions extensions      *)
+(* -------------------------------------------------------------------------- *)
+
+Definition encodeClientHello_def:
+  encodeClientHello (ch : clientHello) : word8 list =
+    w16_to_bytes ch.legacyVersion ++
+    ch.random ++
+    (n2w (LENGTH ch.legacySessionId) :: ch.legacySessionId) ++
+    encodeW16List ch.cipherSuites ++
+    (n2w (LENGTH ch.legacyCompression) :: ch.legacyCompression) ++
+    encodeExtensions ch.extensions
+End
+
+Definition decodeClientHello_def:
+  decodeClientHello (bs : word8 list) : clientHello option =
+    if LENGTH bs < 2 then NONE
+    else
+      let legacyVersion = w16_of_bytes (EL 0 bs) (EL 1 bs) in
+      let a1 = DROP 2 bs in
+      if LENGTH a1 < 32 then NONE
+      else
+        let random = TAKE 32 a1 in
+        let a2 = DROP 32 a1 in
+        if LENGTH a2 < 1 then NONE
+        else
+          let sidLen = w2n (EL 0 a2) in
+          let a3 = DROP 1 a2 in
+          if LENGTH a3 < sidLen then NONE
+          else
+            let sid = TAKE sidLen a3 in
+            let a4  = DROP sidLen a3 in
+            if LENGTH a4 < 2 then NONE
+            else
+              let csTotal = w2n (w16_of_bytes (EL 0 a4) (EL 1 a4)) in
+              let a5 = DROP 2 a4 in
+              if LENGTH a5 < csTotal then NONE
+              else
+                (case decodeW16s_loop (csTotal DIV 2) (TAKE csTotal a5) of
+                   | NONE => NONE
+                   | SOME (suites, _) =>
+                       let a6 = DROP csTotal a5 in
+                       if LENGTH a6 < 1 then NONE
+                       else
+                         let compLen = w2n (EL 0 a6) in
+                         let a7 = DROP 1 a6 in
+                         if LENGTH a7 < compLen then NONE
+                         else
+                           let comp = TAKE compLen a7 in
+                           let a8   = DROP compLen a7 in
+                           (case decodeExtensions a8 of
+                              | NONE => NONE
+                              | SOME exts =>
+                                  SOME <| legacyVersion     := legacyVersion;
+                                          random            := random;
+                                          legacySessionId   := sid;
+                                          cipherSuites      := suites;
+                                          legacyCompression := comp;
+                                          extensions        := exts |>))
+End
+
+Definition wfClientHello_def:
+  wfClientHello (ch : clientHello) <=>
+    LENGTH ch.random = 32 /\
+    LENGTH ch.legacySessionId < 256 /\
+    LENGTH ch.cipherSuites < 32768 /\
+    LENGTH ch.legacyCompression < 256 /\
+    EVERY (\e. LENGTH e.data < 65536) ch.extensions /\
+    LENGTH (FLAT (MAP encodeExtension ch.extensions)) < 65536
+End
+
+Theorem decode_encode_clientHello:
+  !ch. wfClientHello ch ==>
+       decodeClientHello (encodeClientHello ch) = SOME ch
+Proof
+  rw[wfClientHello_def] >>
+  `encodeClientHello ch =
+     w8_of_w16_hi ch.legacyVersion :: w8_of_w16_lo ch.legacyVersion ::
+     (ch.random ++
+      (n2w (LENGTH ch.legacySessionId) ::
+       (ch.legacySessionId ++
+        (w8_of_w16_hi (n2w (LENGTH (encodeW16ListBody ch.cipherSuites))) ::
+         w8_of_w16_lo (n2w (LENGTH (encodeW16ListBody ch.cipherSuites))) ::
+         (encodeW16ListBody ch.cipherSuites ++
+          (n2w (LENGTH ch.legacyCompression) ::
+           (ch.legacyCompression ++
+            encodeExtensions ch.extensions)))))))`
+    by simp[encodeClientHello_def, w16_to_bytes_def, encodeW16List_def] >>
+  simp[decodeClientHello_def] >>
+  simp[w16_of_to_bytes] >>
+  qpat_x_assum `LENGTH ch.random = 32`
+    (fn th => PURE_REWRITE_TAC[GSYM th]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `LENGTH ch.legacySessionId MOD dimword (:8) = LENGTH ch.legacySessionId`
+    by (`dimword (:8) = 256` by EVAL_TAC >> simp[]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `LENGTH (encodeW16ListBody ch.cipherSuites) = 2 * LENGTH ch.cipherSuites`
+    by simp[encodeW16ListBody_length] >>
+  `(2 * LENGTH ch.cipherSuites) < 65536` by simp[] >>
+  `w2n (w16_of_bytes
+          (w8_of_w16_hi (n2w (LENGTH (encodeW16ListBody ch.cipherSuites))))
+          (w8_of_w16_lo (n2w (LENGTH (encodeW16ListBody ch.cipherSuites))))) =
+     LENGTH (encodeW16ListBody ch.cipherSuites)`
+    by (simp[] >> simp[w16_len_roundtrip]) >>
+  simp[] >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `(2 * LENGTH ch.cipherSuites) DIV 2 = LENGTH ch.cipherSuites` by simp[] >>
+  simp[] >>
+  `decodeW16s_loop (LENGTH ch.cipherSuites)
+       (encodeW16ListBody ch.cipherSuites) =
+     SOME (ch.cipherSuites, [])`
+    by (simp[encodeW16ListBody_def] >>
+        qspecl_then [`ch.cipherSuites`, `[]`] mp_tac decodeW16s_loop_correct >>
+        simp[]) >>
+  simp[] >>
+  qpat_x_assum `LENGTH (encodeW16ListBody ch.cipherSuites) = 2 * LENGTH ch.cipherSuites`
+    (fn th => PURE_REWRITE_TAC[GSYM th]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  `LENGTH ch.legacyCompression MOD dimword (:8) = LENGTH ch.legacyCompression`
+    by (`dimword (:8) = 256` by EVAL_TAC >> simp[]) >>
+  simp[rich_listTheory.DROP_LENGTH_APPEND, rich_listTheory.TAKE_LENGTH_APPEND] >>
+  simp[decode_encode_extensions] >>
+  simp[fetch "-" "clientHello_component_equality"]
+QED
 
 val _ = export_theory ();
