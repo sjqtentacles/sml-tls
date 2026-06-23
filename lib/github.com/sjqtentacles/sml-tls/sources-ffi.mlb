@@ -1,0 +1,108 @@
+(* sources-ffi.mlb
+
+   Constant-time FFI build variant of sources.mlb (Track 1a/1b), MLton flavour
+   (loads the _import CryptoFfi implementation). Mirrors the pure dependency
+   list EXACTLY, except it substitutes the FFI-backed variants of three files:
+
+     - sml-aead/aead_ffi.sml          for aead.sml
+         (AES-GCM + ChaCha20-Poly1305 routed through CryptoFfi / OpenSSL +
+          libsodium, constant-time)
+     - sml-crypto-ffi/secure_zero_ffi.sml  for secure_zero_pure.sml
+         (sodium_memzero instead of the portable fallback)
+     - sml-crypto-ffi/rsa_ffi_install.sml  appended after sml-rsa
+         (installs the OpenSSL RSA-PSS backend so Rsa.signPss/verifyPss are
+          constant-time; tls.sml / x509.sml are unchanged and keep calling
+          Rsa.signPss/verifyPss)
+
+   MLB scoping note: an included .mlb is elaborated from the empty basis, so a
+   parent .mlb cannot inject CryptoFfi into this file. This file therefore
+   loads CryptoFfi itself (precondition for aead_ffi / rsa_ffi_install /
+   secure_zero_ffi). The Poly/ML flavour is sources-ffi-poly.mlb (identical
+   except for the CryptoFfi implementation file).
+
+   The default build (sources.mlb) is left 100% pure and needs no OpenSSL. *)
+
+$(SML_LIB)/basis/basis.mlb
+
+(* 0. Constant-time crypto FFI shim (MLton _import). Loaded first so the
+      FFI variants below can reference CryptoFfi. *)
+../sml-crypto-ffi/crypto_ffi.sig
+../sml-crypto-ffi/crypto_ffi_mlton.sml
+
+(* 1. sml-codec: Base16/64, CRC32, SHA-1/256/512. The leaf of the codec DAG. *)
+../sml-codec/sources.mlb
+
+(* 2. sml-bigint: arbitrary-precision integers, no deps. *)
+../sml-bigint/sources.mlb
+
+(* 3. sml-asn1: DER, depends on BigInt (already loaded). *)
+../sml-asn1/asn1.sig
+../sml-asn1/asn1.sml
+
+(* 3b. sml-p256: NIST P-256 ECDH + ECDSA (BigInt/Asn1/Sha256 already loaded). *)
+../sml-p256/p256.sig
+../sml-p256/p256.sml
+
+(* 4. sml-pem: PEM codec, depends on sml-codec (already loaded). *)
+../sml-pem/pem.sig
+../sml-pem/pem.sml
+
+(* 5. sml-crypto: HMAC / PBKDF2 / Token, depends on sml-codec (loaded). *)
+../sml-crypto/hmac.sig
+../sml-crypto/hmac.sml
+../sml-crypto/pbkdf2.sig
+../sml-crypto/pbkdf2.sml
+../sml-crypto/token.sig
+../sml-crypto/token.sml
+
+(* 6. sml-aes / sml-chacha20: standalone block/stream ciphers (used as the
+      byte-identity oracles; the FFI build routes the live path through
+      CryptoFfi but keeps these compiled for completeness/tests). *)
+../sml-aes/aes.sig
+../sml-aes/aes.sml
+../sml-chacha20/chacha20.sig
+../sml-chacha20/chacha20.sml
+
+(* 7. sml-aead: FFI variant of the AEAD facade. Same AEAD signature as
+      aead.sml but dispatches AES-GCM / ChaCha20-Poly1305 to CryptoFfi
+      (constant-time). CryptoFfi must already be in scope (precondition). *)
+../sml-aead/aead.sig
+../sml-aead/aead_ffi.sml
+
+(* 8. sml-kdf: HKDF + scrypt, depends on Hmac (already loaded). *)
+../sml-kdf/kdf.sig
+../sml-kdf/kdf.sml
+
+(* 9. sml-x25519: Curve25519 DH, standalone. *)
+../sml-x25519/x25519.sig
+../sml-x25519/x25519.sml
+
+(* 10. sml-rsa: RSA-PSS (pure), then the FFI install module that routes
+       Rsa.signPss/verifyPss through OpenSSL libcrypto (constant-time). *)
+../sml-rsa/rsa.sig
+../sml-rsa/rsa.sml
+../sml-crypto-ffi/rsa_ffi_install.sml
+
+(* 11. sml-x509: X.509 cert parser, depends on Rsa (loaded). *)
+../sml-x509/x509.sig
+../sml-x509/x509.sml
+
+(* 12. sml-tls: TLS 1.3 signatures + early structures. *)
+tls.sig
+tls.sml
+
+(* 13. Track modules (A1/A2/A3). *)
+recordprotect.sig
+recordprotect.sml
+certverify.sig
+certverify.sml
+extensions.sig
+extensions.sml
+
+(* 14b. Track 1b: FFI-backed secure zeroing (sodium_memzero via CryptoFfi),
+       replacing the portable pure-SML fallback used by the default build. *)
+../sml-crypto-ffi/secure_zero.sig
+../sml-crypto-ffi/secure_zero_ffi.sml
+
+(* 14. sml-tls state machine (J1 integration): TlsClient / TlsServer / Tls. *)
+tlsstate.sml

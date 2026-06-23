@@ -103,6 +103,26 @@ sig
   val verifyPss : { pub : pubkey, hash : hash, saltLen : int
                   , msg : string, sgn : string } -> bool
 
+  (* Pluggable PSS backend (Track 1a). By default signPss / verifyPss use the
+     pure-SML implementation. The constant-time FFI build calls this once at
+     startup to route both through OpenSSL libcrypto (rsa_ffi_install.sml);
+     the supplied functions must honour the same contracts as signPss /
+     verifyPss above. The default (non-FFI) build never calls this. *)
+  val installPssBackend :
+    { sign   : { priv : privkey, hash : hash, salt : string, msg : string }
+               -> string
+    , verify : { pub : pubkey, hash : hash, saltLen : int
+               , msg : string, sgn : string } -> bool } -> unit
+
+  (* The pure-SML PSS implementations, exposed unconditionally so tests can
+     use them as byte-identity oracles even in the FFI build (where signPss /
+     verifyPss are routed through OpenSSL). Identical contracts to the
+     dispatching signPss / verifyPss. *)
+  val signPssPure   : { priv : privkey, hash : hash, salt : string, msg : string }
+                      -> string
+  val verifyPssPure : { pub : pubkey, hash : hash, saltLen : int
+                      , msg : string, sgn : string } -> bool
+
   (* ---- DER / PEM key import & export ----
 
      PKCS#1 (RFC 8017 App. A.1):

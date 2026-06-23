@@ -128,18 +128,33 @@ The HOL4 key-schedule theorems model `sha256` / `hmac_sha256` / `hkdfExpand`
 as abstract constants specified only by output length.  Nothing about their
 values is proved.
 
-### 2. Constant-time execution (partially addressed)
+### 2. Constant-time execution (addressed in the FFI build)
 
-Pure Standard ML arithmetic is **not constant-time**.  To address the
-highest-value paths, `sml-crypto-ffi` routes **X25519 and ChaCha20-Poly1305**
-through **libsodium** (constant-time, audited) via MLton `_import` / Poly/ML
-`Foreign`, with cross-implementation tests asserting byte-identical output to
-the pure-SML oracles.  **Residual risk:** **AES-GCM and RSA-PSS remain
-pure-SML and variable-time** (libsodium offers no portable constant-time
-AES-GCM/RSA).  A timing adversary sharing a CPU can in principle attack those
-paths.  For a ChaCha20-Poly1305 + X25519 deployment the FFI path closes the
-main timing surface; an AES-GCM or RSA-heavy deployment still needs those
-primitives FFI-ized.
+Pure Standard ML arithmetic is **not constant-time**.  To address this,
+`sml-crypto-ffi` routes the high-value primitives through audited,
+constant-time C libraries via MLton `_import` / Poly/ML `Foreign`, with
+cross-implementation tests asserting byte-identical (or, for randomized PSS,
+cross-verifying) output against the pure-SML oracles:
+
+- **X25519 and ChaCha20-Poly1305** → **libsodium** (constant-time, audited).
+- **AES-128/256-GCM and RSA-PSS-SHA256** → **OpenSSL libcrypto 3.x**
+  (`EVP_aes_*_gcm`, `EVP_DigestSign/Verify` with `RSA_PKCS1_PSS_PADDING`),
+  which are constant-time with respect to secret material.  libsodium offers
+  no portable AES-128-GCM or RSA, which is why OpenSSL backs these two.
+
+The **FFI build** (`make test-ffi` / `make test-ffi-poly`, selecting
+`sources-ffi.mlb`) routes the live handshake through these constant-time
+backends: AES-GCM record protection (via the `aead_ffi` AEAD facade), the
+RSA-PSS `CertificateVerify` and X.509 RSASSA-PSS signature checks (via an
+OpenSSL backend installed over `Rsa.signPss`/`verifyPss`), and key zeroing
+(`sodium_memzero`).  Byte-identity against NIST GCM vectors and pure↔OpenSSL
+RSA-PSS cross-verification are proved in `test/ffi.sml` on both compilers.
+
+**Residual risk:** the **default** (no-FFI) build is still 100% pure-SML and
+variable-time across all primitives; it is retained as the portable build and
+as the proof oracle.  Deployments needing constant-time execution must use the
+FFI build.  OpenSSL's and libsodium's own constant-timeness is trusted
+(audited upstream), the same trust posture applied to all FFI primitives.
 
 ### 3. Mechanized refinement from spec to code (partially addressed)
 
@@ -206,8 +221,9 @@ Completed (see `AUDIT.md`, `proof/PROOF_STATUS.md`, `proof/PROOF_CHAIN.md`):
    the HOL4 spec; control-phase state-machine fragment refined.
 4. ✅ **Spec→machine-code chain** demonstrated end-to-end with the verified
    CakeML compiler; formal chain documented with explicit remaining gaps.
-5. ✅ **Constant-time crypto** (partial): X25519 + ChaCha20-Poly1305 via
-   libsodium FFI; AES-GCM/RSA-PSS still pure-SML.
+5. ✅ **Constant-time crypto** (FFI build): X25519 + ChaCha20-Poly1305 via
+   libsodium; AES-128/256-GCM + RSA-PSS-SHA256 via OpenSSL libcrypto, with the
+   live handshake routed through them in the `sources-ffi.mlb` build.
 6. ✅ **Memory zeroing**: `zeroize` API via `sodium_memzero` (best-effort).
 7. ✅ **PSK resumption (accept path)**: server ticket store, binder
    verification, PSK key schedule.
@@ -216,7 +232,6 @@ Remaining:
 
 - Full `ml_translatorLib` certification of the refinement (GAP A) and in-logic
   instantiation of `compile_correct` (GAP B) — `proof/PROOF_CHAIN.md`.
-- FFI-ize AES-GCM and RSA-PSS for fully constant-time operation.
 - Extend refinement to the remaining codecs and the full crypto-bearing
   handshake simulation.
 - **Commission the external security audit** (`AUDIT.md`) and remediate

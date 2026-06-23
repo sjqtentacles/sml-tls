@@ -49,6 +49,16 @@ struct
       (byteArr, byteArr, cInt, byteArr, cInt, byteArr, byteArr), cInt)
     val cOpen = buildCall7 (getSymbol lib "sml_chacha20poly1305_open",
       (byteArr, byteArr, cInt, byteArr, cInt, byteArr, byteArr), cInt)
+    val cAesGcmSeal = buildCall9 (getSymbol lib "sml_aesgcm_seal",
+      (byteArr, byteArr, cInt, byteArr, cInt, byteArr, cInt, byteArr, cInt),
+      cInt)
+    val cAesGcmOpen = buildCall9 (getSymbol lib "sml_aesgcm_open",
+      (byteArr, byteArr, cInt, byteArr, cInt, byteArr, cInt, byteArr, cInt),
+      cInt)
+    val cRsaPssVerify = buildCall8 (getSymbol lib "sml_rsa_pss_verify",
+      (byteArr, cInt, cInt, cInt, byteArr, cInt, byteArr, cInt), cInt)
+    val cRsaPssSign = buildCall8 (getSymbol lib "sml_rsa_pss_sign",
+      (byteArr, cInt, byteArr, cInt, cInt, cInt, byteArr, cInt), cInt)
     val cMemzeroI = buildCall2 (getSymbol lib "sml_memzero",
       (byteArr, cInt), cVoid)
   end
@@ -120,6 +130,69 @@ struct
           in
             if n < 0 then NONE else SOME (fromArr out)
           end )
+  end
+
+  structure AesGcm =
+  struct
+    fun checkKey key =
+      if String.size key = 16 orelse String.size key = 32 then ()
+      else raise CryptoFfi ("key must be 16 or 32 bytes, got "
+                            ^ Int.toString (String.size key))
+
+    fun seal key iv aad plaintext =
+      ( init ()
+      ; checkKey key
+      ; checkLen ("iv", iv, 12)
+      ; let
+          val out = Array.array (String.size plaintext + 16, 0)
+          val n = cAesGcmSeal (out, toArr plaintext, String.size plaintext,
+                               toArr aad, String.size aad, toArr iv, 12,
+                               toArr key, String.size key)
+        in
+          if n < 0 then raise CryptoFfi "aes-gcm seal failed"
+          else fromArr out
+        end )
+
+    fun open' key iv aad sealed =
+      ( init ()
+      ; checkKey key
+      ; checkLen ("iv", iv, 12)
+      ; if String.size sealed < 16 then NONE
+        else
+          let
+            val out = Array.array (String.size sealed - 16, 0)
+            val n = cAesGcmOpen (out, toArr sealed, String.size sealed,
+                                 toArr aad, String.size aad, toArr iv, 12,
+                                 toArr key, String.size key)
+          in
+            if n < 0 then NONE else SOME (fromArr out)
+          end )
+  end
+
+  structure RsaPss =
+  struct
+    fun verify {spkiDer, hashId, saltLen, msg, sgn} =
+      ( init ()
+      ; let
+          val n = cRsaPssVerify (toArr spkiDer, String.size spkiDer,
+                                 hashId, saltLen,
+                                 toArr msg, String.size msg,
+                                 toArr sgn, String.size sgn)
+        in n = 1 end )
+
+    fun sign {pkcs8Der, hashId, saltLen, msg} =
+      ( init ()
+      ; let
+          (* RSA signatures are at most the modulus length; 1024 bytes
+             covers up to 8192-bit keys. *)
+          val cap = 1024
+          val out = Array.array (cap, 0)
+          val n = cRsaPssSign (out, cap, toArr pkcs8Der, String.size pkcs8Der,
+                               hashId, saltLen, toArr msg, String.size msg)
+        in
+          if n < 0 then raise CryptoFfi "rsa-pss sign failed"
+          else CharVector.tabulate (n, fn i => Char.chr (Array.sub (out, i)))
+        end )
   end
 
   (* Word8Array path: copy into an int array, zero via the shim, then copy

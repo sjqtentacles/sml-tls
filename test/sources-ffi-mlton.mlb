@@ -1,17 +1,24 @@
-(* FFI test build (MLton). Loads the base library, then the MLton-specific
-   CryptoFfi implementation (_import) and the cross-impl byte-identity
-   tests. Linked against the libsodium shim by the Makefile's test-ffi
+(* FFI test build (MLton). Constant-time end-to-end build. The FFI seam
+   (sources-ffi.mlb) loads the MLton CryptoFfi implementation and routes the
+   live AEAD / RSA-PSS / key-zeroing paths through OpenSSL libcrypto +
+   libsodium, then this file adds the full TLS test suite + the cross-impl
+   byte-identity vectors. Linked against the shim by the Makefile's test-ffi
    target. NOT used by Poly/ML (see sources-ffi-poly.mlb). *)
 
 $(SML_LIB)/basis/basis.mlb
 
-../lib/github.com/sjqtentacles/sml-tls/sources.mlb
-
-(* Constant-time crypto FFI shim: MLton _import implementation. *)
-../lib/github.com/sjqtentacles/sml-crypto-ffi/crypto_ffi.sig
-../lib/github.com/sjqtentacles/sml-crypto-ffi/crypto_ffi_mlton.sml
+(* FFI seam: same modules as sources.mlb but with the constant-time variants,
+   and with CryptoFfi (MLton _import) loaded internally. *)
+../lib/github.com/sjqtentacles/sml-tls/sources-ffi.mlb
 
 harness.sml
+test.sml
+record.sml
+cert.sml
+ext.sml
+hs2.sml
+harden.sml
+zeroize.sml
 ffi.sml
 ffi-entry.sml
 main.sml

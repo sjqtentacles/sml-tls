@@ -237,13 +237,13 @@ struct
       val maskedDB' = clearTopBits (maskedDB, 8 * emLen - emBits)
     in maskedDB' ^ h ^ byte 0xBC end
 
-  fun signPss { priv : privkey, hash, salt, msg } =
+  fun signPssPure { priv : privkey, hash, salt, msg } =
     let
       val emBits = bitLength (#n priv) - 1
       val em = emsaPssEncode (hash, msg, salt, emBits)
     in i2osp (rsaPrivate (priv, os2ip em), modulusBytesN (#n priv)) end
 
-  fun verifyPss { pub : pubkey, hash, saltLen, msg, sgn } =
+  fun verifyPssPure { pub : pubkey, hash, saltLen, msg, sgn } =
     (let
        val n     = #n pub
        val k     = modulusBytesN n
@@ -284,6 +284,24 @@ struct
          end
        end
      end) handle _ => false
+
+  (* Pluggable PSS backend (Track 1a). signPss / verifyPss dispatch through
+     these refs, which default to the pure-SML implementations above so the
+     standalone build is byte-for-byte unchanged. The FFI build installs an
+     OpenSSL/libcrypto-backed (constant-time) override via installPssBackend
+     (see rsa_ffi_install.sml), keeping these exact signatures. *)
+  val signPssRef =
+    ref (signPssPure : { priv : privkey, hash : hash, salt : string
+                       , msg : string } -> string)
+  val verifyPssRef =
+    ref (verifyPssPure : { pub : pubkey, hash : hash, saltLen : int
+                         , msg : string, sgn : string } -> bool)
+
+  fun signPss arg   = (!signPssRef) arg
+  fun verifyPss arg = (!verifyPssRef) arg
+
+  fun installPssBackend { sign, verify } =
+    ( signPssRef := sign; verifyPssRef := verify )
 
   (* ---------------------------------------------------------------- *)
   (* EME-OAEP encryption (RFC 8017 sec. 7.1)                          *)

@@ -1,17 +1,22 @@
-(* FFI test build (Poly/ML). Identical to sources-ffi-mlton.mlb except it
-   loads the Poly/ML-specific CryptoFfi implementation (Foreign). polybuild
-   expands this flat list, skips main.sml, and exports `main` from
-   ffi-entry.sml. NOT used by MLton. *)
+(* FFI test build (Poly/ML). Identical to sources-ffi-mlton.mlb except the
+   seam (sources-ffi-poly.mlb) loads the Poly/ML (Foreign) CryptoFfi
+   implementation. polybuild expands this flat list, skips main.sml, and
+   exports `main` from ffi-entry.sml. NOT used by MLton. *)
 
 $(SML_LIB)/basis/basis.mlb
 
-../lib/github.com/sjqtentacles/sml-tls/sources.mlb
-
-(* Constant-time crypto FFI shim: Poly/ML Foreign implementation. *)
-../lib/github.com/sjqtentacles/sml-crypto-ffi/crypto_ffi.sig
-../lib/github.com/sjqtentacles/sml-crypto-ffi/crypto_ffi_poly.sml
+(* FFI seam: same modules as sources.mlb but with the constant-time variants,
+   and with CryptoFfi (Poly/ML Foreign) loaded internally. *)
+../lib/github.com/sjqtentacles/sml-tls/sources-ffi-poly.mlb
 
 harness.sml
+test.sml
+record.sml
+cert.sml
+ext.sml
+hs2.sml
+harden.sml
+zeroize.sml
 ffi.sml
 ffi-entry.sml
 main.sml

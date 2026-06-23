@@ -46,6 +46,17 @@ struct
     else (print ("  FAIL - " ^ name ^ ": " ^ toHex expected ^ " <> "
                  ^ toHex actual ^ "\n"); check name false)
 
+  (* Read a binary fixture file (relative to the repo root, where the test
+     binary runs) as a raw byte string. Works under MLton and Poly/ML. *)
+  fun readBin path =
+    let
+      val ins = BinIO.openIn path
+      val content = BinIO.inputAll ins
+      val () = BinIO.closeIn ins
+    in
+      Byte.bytesToString content
+    end
+
   fun run () =
     let
       val () = CryptoFfi.init ()
@@ -151,6 +162,152 @@ struct
       val () = checkBytes ("seal empty aad: FFI == oracle",
                  ChaCha20Poly1305.seal key nonce "" pt,
                  CryptoFfi.ChaCha20Poly1305.seal key nonce "" pt)
+
+      (* =============================================================== *)
+      val () = section "FFI AES-128-GCM: NIST vector (shim == oracle)"
+
+      (* NIST GCM test vector (gcmEncryptExtIV128, 96-bit IV, with AAD).
+         Source: NIST CAVP gcmEncryptExtIV128.rsp, Keylen=128 Taglen=128. *)
+      val aes128Key = fromHex "feffe9928665731c6d6a8f9467308308"
+      val aes128Iv  = fromHex "cafebabefacedbaddecaf888"
+      val aes128Aad = fromHex "feedfacedeadbeeffeedfacedeadbeefabaddad2"
+      val aes128Pt  = fromHex
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+        \1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"
+      val aes128Exp = fromHex
+        "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e\
+        \21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091\
+        \5bc94fbc3221a5db94fae95ae7121a47"
+      val aes128OracleSealed = AesGcm.seal aes128Key aes128Iv aes128Aad aes128Pt
+      val () = checkBytes ("AES-128-GCM: oracle seal matches NIST",
+                           aes128Exp, aes128OracleSealed)
+      val aes128FfiSealed = CryptoFfi.AesGcm.seal aes128Key aes128Iv aes128Aad aes128Pt
+      val () = checkBytes ("AES-128-GCM: FFI seal matches NIST",
+                           aes128Exp, aes128FfiSealed)
+      val () = checkBytes ("AES-128-GCM: FFI seal byte-identical to oracle",
+                           aes128OracleSealed, aes128FfiSealed)
+      val () = case CryptoFfi.AesGcm.open' aes128Key aes128Iv aes128Aad aes128OracleSealed of
+                   SOME p => checkBytes ("AES-128-GCM: FFI open'(oracle seal) == pt", aes128Pt, p)
+                 | NONE => check "AES-128-GCM: FFI open'(oracle seal) authenticates" false
+      val () = case AesGcm.open' aes128Key aes128Iv aes128Aad aes128FfiSealed of
+                   SOME p => checkBytes ("AES-128-GCM: oracle open'(FFI seal) == pt", aes128Pt, p)
+                 | NONE => check "AES-128-GCM: oracle open'(FFI seal) authenticates" false
+
+      (* =============================================================== *)
+      val () = section "FFI AES-256-GCM: NIST vector (shim == oracle)"
+
+      (* NIST GCM test vector (gcmEncryptExtIV256, 96-bit IV, with AAD).
+         Source: NIST CAVP gcmEncryptExtIV256.rsp, Keylen=256 Taglen=128. *)
+      val aes256Key = fromHex
+        "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308"
+      val aes256Iv  = fromHex "cafebabefacedbaddecaf888"
+      val aes256Aad = fromHex "feedfacedeadbeeffeedfacedeadbeefabaddad2"
+      val aes256Pt  = fromHex
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+        \1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"
+      val aes256Exp = fromHex
+        "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa\
+        \8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662\
+        \76fc6ece0f4e1768cddf8853bb2d551b"
+      val aes256OracleSealed = AesGcm.seal aes256Key aes256Iv aes256Aad aes256Pt
+      val () = checkBytes ("AES-256-GCM: oracle seal matches NIST",
+                           aes256Exp, aes256OracleSealed)
+      val aes256FfiSealed = CryptoFfi.AesGcm.seal aes256Key aes256Iv aes256Aad aes256Pt
+      val () = checkBytes ("AES-256-GCM: FFI seal matches NIST",
+                           aes256Exp, aes256FfiSealed)
+      val () = checkBytes ("AES-256-GCM: FFI seal byte-identical to oracle",
+                           aes256OracleSealed, aes256FfiSealed)
+      val () = case CryptoFfi.AesGcm.open' aes256Key aes256Iv aes256Aad aes256FfiSealed of
+                   SOME p => checkBytes ("AES-256-GCM: FFI open'(FFI seal) == pt", aes256Pt, p)
+                 | NONE => check "AES-256-GCM: FFI open'(FFI seal) authenticates" false
+      val () = case AesGcm.open' aes256Key aes256Iv aes256Aad aes256FfiSealed of
+                   SOME p => checkBytes ("AES-256-GCM: oracle open'(FFI seal) == pt", aes256Pt, p)
+                 | NONE => check "AES-256-GCM: oracle open'(FFI seal) authenticates" false
+
+      (* Tamper + empty edge cases. *)
+      val () = section "FFI AES-GCM: tamper + empty edge cases"
+      val aesTampered =
+        let val n = String.size aes128FfiSealed
+            val last = Char.ord (String.sub (aes128FfiSealed, n - 1))
+        in String.substring (aes128FfiSealed, 0, n - 1)
+           ^ String.str (Char.chr (last mod 256 + (if last = 0 then 1 else ~1)))
+        end
+      val () = check "AES-128-GCM: FFI open' rejects a tampered tag"
+        (CryptoFfi.AesGcm.open' aes128Key aes128Iv aes128Aad aesTampered = NONE)
+      val () = checkBytes ("AES-128-GCM: seal empty pt: FFI == oracle",
+                 AesGcm.seal aes128Key aes128Iv aes128Aad "",
+                 CryptoFfi.AesGcm.seal aes128Key aes128Iv aes128Aad "")
+      val () = checkBytes ("AES-128-GCM: seal empty aad: FFI == oracle",
+                 AesGcm.seal aes128Key aes128Iv "" aes128Pt,
+                 CryptoFfi.AesGcm.seal aes128Key aes128Iv "" aes128Pt)
+
+      (* =============================================================== *)
+      val () = section "FFI RSA-PSS-SHA256: cross-verify (shim <-> oracle)"
+
+      (* Reuse the committed RSA key/cert fixtures (test/fixtures/certs):
+         cv-key.pkcs8.der is the private key, its public half is used to
+         verify. No new key material is invented. *)
+      val rsaPriv  = Rsa.decodePkcs8Der (readBin "test/fixtures/certs/cv-key.pkcs8.der")
+      val rsaPub   = Rsa.pubOf rsaPriv
+      val rsaSpki  = Rsa.encodeSpkiDer rsaPub
+      val rsaPkcs8 = Rsa.encodePkcs8Der rsaPriv
+
+      val rsaMsg = "TLS 1.3 CertificateVerify transcript (FFI cross-check)"
+
+      (* TLS case: SHA-256, saltLen 32. Oracle-signed (fixed zero salt, pure
+         SML) must verify under the FFI/OpenSSL verifier. We use the pure
+         oracles explicitly (Rsa.signPssPure / verifyPssPure) so this remains
+         a genuine pure-vs-FFI cross-check even in the FFI build, where
+         Rsa.signPss / verifyPss are themselves routed through OpenSSL. *)
+      val cvSalt   = String.implode (List.tabulate (32, fn _ => Char.chr 0))
+      val oracleSig = Rsa.signPssPure {priv = rsaPriv, hash = Rsa.SHA256,
+                                       salt = cvSalt, msg = rsaMsg}
+      val () = check "RSA-PSS-256 saltLen32: FFI verifies oracle signature"
+        (CryptoFfi.RsaPss.verify {spkiDer = rsaSpki, hashId = 1, saltLen = 32,
+                                  msg = rsaMsg, sgn = oracleSig})
+
+      (* FFI-signed (random salt) must verify under the pure oracle. *)
+      val ffiSig = CryptoFfi.RsaPss.sign {pkcs8Der = rsaPkcs8, hashId = 1,
+                                          saltLen = 32, msg = rsaMsg}
+      val () = check "RSA-PSS-256 saltLen32: oracle verifies FFI signature"
+        (Rsa.verifyPssPure {pub = rsaPub, hash = Rsa.SHA256, saltLen = 32,
+                            msg = rsaMsg, sgn = ffiSig})
+      val () = check "RSA-PSS-256 saltLen32: FFI verifies FFI signature"
+        (CryptoFfi.RsaPss.verify {spkiDer = rsaSpki, hashId = 1, saltLen = 32,
+                                  msg = rsaMsg, sgn = ffiSig})
+
+      (* Wrong message must NOT verify (either direction). *)
+      val () = check "RSA-PSS-256: FFI rejects wrong message"
+        (not (CryptoFfi.RsaPss.verify {spkiDer = rsaSpki, hashId = 1, saltLen = 32,
+                                       msg = rsaMsg ^ "x", sgn = oracleSig}))
+      val () = check "RSA-PSS-256: oracle rejects wrong message"
+        (not (Rsa.verifyPssPure {pub = rsaPub, hash = Rsa.SHA256, saltLen = 32,
+                                 msg = rsaMsg ^ "x", sgn = ffiSig}))
+
+      (* Tampered signature must NOT verify under the FFI verifier. *)
+      val rsaSigBad =
+        let val n = String.size oracleSig
+            val last = Char.ord (String.sub (oracleSig, n - 1))
+        in String.substring (oracleSig, 0, n - 1)
+           ^ String.str (Char.chr (last mod 256 + (if last = 0 then 1 else ~1)))
+        end
+      val () = check "RSA-PSS-256: FFI rejects a tampered signature"
+        (not (CryptoFfi.RsaPss.verify {spkiDer = rsaSpki, hashId = 1, saltLen = 32,
+                                       msg = rsaMsg, sgn = rsaSigBad}))
+
+      (* X.509-style case: SHA-256, a different saltLen (20). Cross-verify. *)
+      val () = section "FFI RSA-PSS-SHA256: X.509-style saltLen (cross-verify)"
+      val x509Sig = CryptoFfi.RsaPss.sign {pkcs8Der = rsaPkcs8, hashId = 1,
+                                           saltLen = 20, msg = rsaMsg}
+      val () = check "RSA-PSS-256 saltLen20: oracle verifies FFI signature"
+        (Rsa.verifyPssPure {pub = rsaPub, hash = Rsa.SHA256, saltLen = 20,
+                            msg = rsaMsg, sgn = x509Sig})
+      val x509OracleSig = Rsa.signPssPure {priv = rsaPriv, hash = Rsa.SHA256,
+                                           salt = String.implode (List.tabulate (20, fn _ => Char.chr 0)),
+                                           msg = rsaMsg}
+      val () = check "RSA-PSS-256 saltLen20: FFI verifies oracle signature"
+        (CryptoFfi.RsaPss.verify {spkiDer = rsaSpki, hashId = 1, saltLen = 20,
+                                  msg = rsaMsg, sgn = x509OracleSig})
 
       (* =============================================================== *)
       val () = section "FFI memzero (Track 1b primitive)"

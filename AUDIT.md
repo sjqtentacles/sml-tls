@@ -34,15 +34,18 @@ libsodium for constant-time execution. The audit should cover:
    chain construction, signature verification, basic-constraints / path-length,
    hostname matching, validity windows.
 4. **Crypto integration boundary** (`sml-crypto-ffi/`): the FFI marshalling to
-   libsodium (length handling, error propagation, tag verification), and the
-   residual pure-SML primitives (AES-GCM, RSA-PSS) that are **not** constant-time.
+   libsodium and OpenSSL libcrypto (length handling, error propagation, tag
+   verification, DER key marshalling), covering X25519 + ChaCha20-Poly1305
+   (libsodium) and AES-128/256-GCM + RSA-PSS-SHA256 (OpenSSL). The default
+   (no-FFI) build retains the pure-SML primitives as the portable fallback and
+   proof oracle; those are **not** constant-time.
 5. **Key lifecycle** (`SecureZero`, `zeroize` / `zeroizeConfig`): whether key
    material is erased on teardown and the documented best-effort limits.
 
 ### Explicitly out of scope (already documented as trusted/assumed)
 - The cryptographic *strength* of SHA-256/HMAC/AEAD/X25519/RSA primitives
   (assumed, not derived — standard for an implementation audit).
-- The libsodium internals (separately audited upstream).
+- The libsodium and OpenSSL libcrypto internals (separately audited upstream).
 - The CakeML compiler correctness proof (upstream formal result).
 
 ---
@@ -52,14 +55,16 @@ libsodium for constant-time execution. The audit should cover:
 - **In scope:** a network adversary (active MITM) sending arbitrary bytes;
   malformed handshake/record inputs; malicious certificate chains; replay /
   resumption-ticket abuse; downgrade attempts.
-- **Timing side channels:** in scope **for the FFI-backed primitives**
-  (X25519, ChaCha20-Poly1305 via libsodium — expected constant-time) and as a
-  **known residual risk** for the pure-SML AES-GCM and RSA-PSS paths, which are
-  variable-time and documented as such. The auditor should confirm the residual
-  variable-time surface and advise on FFI-izing AES-GCM/RSA if required for the
-  deployment.
+- **Timing side channels:** in scope **for the FFI-backed primitives** in the
+  FFI build — X25519 + ChaCha20-Poly1305 (libsodium) and AES-128/256-GCM +
+  RSA-PSS-SHA256 (OpenSSL libcrypto), all expected constant-time. The default
+  (no-FFI) build is pure-SML and variable-time across all primitives; it is the
+  portable fallback / proof oracle and not intended for timing-adversarial
+  deployments. The auditor should confirm the FFI marshalling preserves the
+  constant-time guarantee and that no secret-dependent SML pre/post-processing
+  reintroduces a timing surface.
 - **Out of scope:** physical attacks, compromised host OS, supply-chain of the
-  SML compilers (MLton/Poly/ML) and libsodium.
+  SML compilers (MLton/Poly/ML), libsodium, and OpenSSL libcrypto.
 
 ---
 
@@ -101,8 +106,10 @@ libsodium for constant-time execution. The audit should cover:
 # Functional test suite (both compilers)
 cd sml-tls && make test && make test-poly      # => 306 passed, 0 failed each
 
-# FFI constant-time path (requires libsodium)
-make test-ffi                                   # cross-impl byte-identity vs oracle
+# FFI constant-time path (requires libsodium + OpenSSL libcrypto)
+make test-ffi && make test-ffi-poly             # => 346 passed each
+                                                # (NIST AES-GCM + RSA-PSS byte-identity/cross-verify
+                                                #  vectors + the full handshake suite via the FFI seam)
 
 # Formal proofs (requires HOL4 + Poly/ML)
 cd proof && Holmake cleanAll && Holmake         # => 5 theories OK
@@ -120,9 +127,16 @@ bash scripts/run_afl.sh
 
 ## 5. Known issues to flag to the auditor up front
 
-1. **AES-GCM and RSA-PSS remain pure-SML and variable-time** (libsodium offers
-   no portable constant-time AES-GCM/RSA). For an AES-GCM-only deployment with
-   a timing adversary, these need FFI-izing.
+1. **Constant-time crypto requires the FFI build.** The default (no-FFI) build
+   is pure-SML and variable-time. The **FFI build** (`make test-ffi` /
+   `make test-ffi-poly`, selecting `sources-ffi.mlb`) routes every high-value
+   primitive through audited constant-time C: X25519 + ChaCha20-Poly1305 via
+   libsodium, and **AES-128/256-GCM + RSA-PSS-SHA256 via OpenSSL libcrypto**
+   (libsodium has no AES-128-GCM / RSA). The live handshake (AES-GCM record
+   protection, RSA-PSS `CertificateVerify`, X.509 RSASSA-PSS) runs through
+   these in the FFI build; byte-identity (NIST GCM) and pure↔OpenSSL RSA-PSS
+   cross-verification are proved in `test/ffi.sml` on both compilers. A
+   deployment with a timing adversary must use the FFI build, not the default.
 2. **Memory zeroing is best-effort**: SML strings are immutable and the GC may
    have copied secrets; `zeroize` overwrites the currently-referenced buffers
    only (documented in `SECURITY.md`).
