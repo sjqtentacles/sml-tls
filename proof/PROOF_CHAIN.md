@@ -92,9 +92,30 @@ that each CakeML-shaped codec equals the `tls_wireTheory` spec codec transported
 across the byte-representation map `b2n = w2n`, `s2ns = MAP w2n`. Representative
 proved theorems: `cml_contentTypeToByte_refines`, `cml_byteToContentType_refines`,
 `cml_encodePlaintext_refines`, `cml_decodePlaintext_refines`,
-`cml_encodeCiphertext_refines`, and handshake-transition refinements
-(`cml_startHandshake_refines_transition`, `cml_connected_refines_idle`, …). All
-33 theorems carry only the benign `DISK_THM` tag.
+`cml_encodeCiphertext_refines`, `cml_decodeCiphertext_refines`, and
+handshake-transition refinements (`cml_startHandshake_refines_transition`,
+`cml_connected_refines_idle`, …). Every theorem carries only the benign
+`DISK_THM` tag.
+
+> ### EXPANDED codec refinement coverage (this pass)
+> The refined-codec set was extended beyond `contentType`/`plaintext`/
+> `ciphertext`. Added and proved (no cheats, `DB.axioms = 0`, only `DISK_THM`):
+> `cml_decodeCiphertext_refines` (closing the prior define-but-unrefined hole),
+> and the full **encode**-direction refinements of the four structured,
+> length-prefixed handshake bodies — `cml_encodeServerHello_refines`,
+> `cml_encodeClientHello_refines`, `cml_encodeNewSessionTicket_refines`,
+> `cml_encodeCertificate_refines` — each under the **same** honest `wf<X>`
+> wire-length side condition the Track 2a round-trips use, built on proved
+> structured-codec helper lemmas (`cml_word16ToBytes_refines`,
+> `cml_word32ToBytes_refines`, `cml_len3_refines`, `cml_encodeExtensions_refines`,
+> `cml_encodeWord16List_refines`). Composition corollaries
+> (`cml_*_roundtrip_via_spec`) tie each CakeML encoder output, via injective
+> `s2ns`, to a spec wire string the spec decoder inverts. The structured
+> **decoders** (recursive, `Bad`-exception-driven, index-based) are **not** yet
+> refined as standalone equational theorems — that direction is covered
+> soundly-but-indirectly by the composition corollaries and recorded as honest
+> remaining work in `PROOF_STATUS.md`. This expansion **does not** affect GAP A
+> or GAP B below.
 
 > ### GAP A — the translator-certification gap (honest)
 > These equalities are proved against a **by-hand HOL4 mirror** of the CakeML
