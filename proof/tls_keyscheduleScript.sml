@@ -16,13 +16,14 @@
 
    The underlying hash is SHA-256 (cipher suites TLS_AES_128_GCM_SHA256
    and TLS_CHACHA20_POLY1305_SHA256), matching the SML `TlsKeySchedule`
-   and the RFC 8448 vectors. SHA-256, HMAC, and HKDF are taken as trusted
-   primitives here (Phase 7 either ports a verified SHA-256 from the
-   CakeML tower or documents each as a trusted axiom).
+   and the RFC 8448 vectors. SHA-256, HMAC and HKDF are CONCRETE, computable
+   functions here, imported from `tls_sha256Theory` (Track 2b); the RFC 8448
+   key-schedule vectors are discharged by `EVAL` at the bottom of this file.
 *)
 
 open HolKernel Parse boolLib bossLib;
 open listTheory optionTheory stringTheory wordsTheory;
+open tls_sha256Theory;
 
 val _ = new_theory "tls_keyschedule";
 
@@ -61,39 +62,50 @@ Definition tls13Prefix_def:
 End
 
 (* -------------------------------------------------------------------------- *)
-(*  Trusted crypto primitives                                                 *)
+(*  Concrete crypto primitives (Track 2b)                                     *)
 (* -------------------------------------------------------------------------- *)
 
-(* SHA-256, HMAC-SHA-256 and HKDF-Expand are modeled as TRUSTED, abstract
-   primitives.  We do NOT define their values (so nothing false about their
-   contents can be derived); we only pin down their output-length contracts,
-   which is all the key-schedule correctness arguments below rely on.
+(* SHA-256, HMAC-SHA-256 and HKDF-Expand are now CONCRETE, computable
+   functions, taken from `tls_sha256Theory` (an independent FIPS 180-4 /
+   RFC 2104 / RFC 5869 HOL4 implementation, validated by `EVAL` against the
+   NIST "" and "abc" digests and against the RFC 8448 key-schedule vectors --
+   see the `rfc8448_*` theorems at the bottom of this file and the
+   `tls_sha256` NIST checks).  They are ordinary `Definition`s, so they carry
+   NO axiom and add NO oracle; their values are pinned down and can be reduced
+   by `EVAL`.
 
-   These are introduced by `new_specification`, a *conservative* (sound)
-   extension -- the existence witness is the constant-length function -- so
-   they carry NO axiom tag.  The cryptographic strength of SHA-256/HMAC
-   (collision/preimage resistance, PRF security) is an assumption recorded
-   in PROOF_STATUS.md, not a proved property.  A future refinement would
-   link `sha256` to a verified bit-level SHA-256 (e.g. from the CakeML
-   tower) and discharge the RFC 8448 test vectors against it. *)
+   ROUTE B note: `tls_sha256$sha256_digest` is an independent re-implementation
+   of SHA-256; it is structurally aligned with the CakeML `cakeml/sha256.sml`
+   source (same K constants, init vector, padding, schedule and compression)
+   but is NOT yet proved equal to it by `ml_translatorLib` translation.  That
+   translation link is the remaining Track 2c work (see PROOF_STATUS.md).
+
+   The cryptographic *strength* of SHA-256/HMAC (collision/preimage
+   resistance, PRF security) remains an assumption recorded in
+   PROOF_STATUS.md, not a proved property. *)
 
 (* SHA-256 : produces exactly hashLen (32) bytes. *)
-Theorem sha256_exists[local]:
-  ?f : word8 list -> word8 list. !bs. LENGTH (f bs) = hashLen
+Definition sha256_def:
+  sha256 (bs : word8 list) : word8 list = sha256_digest bs
+End
+
+Theorem sha256_length:
+  !bs. LENGTH (sha256 bs) = hashLen
 Proof
-  Q.EXISTS_TAC `\bs. GENLIST (\_. 0w) hashLen` >> simp[]
+  rw[sha256_def, hashLen_def, sha256_digest_length]
 QED
-val sha256_length =
-  new_specification ("sha256_length", ["sha256"], sha256_exists);
 
 (* HMAC-SHA-256 : keyed, produces exactly hashLen (32) bytes. *)
-Theorem hmac_sha256_exists[local]:
-  ?f : word8 list -> word8 list -> word8 list. !k d. LENGTH (f k d) = hashLen
+Definition hmac_sha256_def:
+  hmac_sha256 (k : word8 list) (d : word8 list) : word8 list =
+    tls_sha256$hmac_sha256 k d
+End
+
+Theorem hmac_sha256_length:
+  !k d. LENGTH (hmac_sha256 k d) = hashLen
 Proof
-  Q.EXISTS_TAC `\k d. GENLIST (\_. 0w) hashLen` >> simp[]
+  rw[hmac_sha256_def, hashLen_def, tls_sha256Theory.hmac_sha256_length]
 QED
-val hmac_sha256_length =
-  new_specification ("hmac_sha256_length", ["hmac_sha256"], hmac_sha256_exists);
 
 (* HKDF-Extract(salt, IKM) = HMAC-Hash(salt, IKM)  (RFC 5869 2.2). *)
 Definition hkdfExtract_def:
@@ -101,15 +113,17 @@ Definition hkdfExtract_def:
     hmac_sha256 salt ikm
 End
 
-(* HKDF-Expand(PRK, info, L) : RFC 5869 2.3 -- produces exactly L bytes.
-   The HMAC iteration is abstracted; only the output length is specified. *)
-Theorem hkdfExpand_exists[local]:
-  ?f : word8 list -> word8 list -> num -> word8 list. !prk info L. LENGTH (f prk info L) = L
+(* HKDF-Expand(PRK, info, L) : RFC 5869 2.3 -- produces exactly L bytes. *)
+Definition hkdfExpand_def:
+  hkdfExpand (prk : word8 list) (info : word8 list) (L : num) : word8 list =
+    hkdf_expand prk info L
+End
+
+Theorem hkdfExpand_length:
+  !prk info L. LENGTH (hkdfExpand prk info L) = L
 Proof
-  Q.EXISTS_TAC `\prk info L. GENLIST (\_. 0w) L` >> simp[]
+  rw[hkdfExpand_def, hkdf_expand_length]
 QED
-val hkdfExpand_length =
-  new_specification ("hkdfExpand_length", ["hkdfExpand"], hkdfExpand_exists);
 
 (* -------------------------------------------------------------------------- *)
 (*  HKDF-Expand-Label (RFC 8446 7.1)                                          *)
@@ -363,6 +377,96 @@ Theorem schedule_lengths:
 Proof
   rw[schedule_def, earlySecret_length, handshakeSecret_length,
      masterSecret_length, deriveSecret_length]
+QED
+
+(* -------------------------------------------------------------------------- *)
+(*  RFC 8448 key-schedule test vectors (discharged by EVAL)                   *)
+(* -------------------------------------------------------------------------- *)
+
+(* -------------------------------------------------------------------------- *)
+(*  Fast evaluation compset for the RFC 8448 vectors                          *)
+(*                                                                            *)
+(*  Bare `EVAL` reduces word32 arithmetic and shifts via the default srw      *)
+(*  compset, which is pathologically slow over the 64-round SHA-256 core      *)
+(*  (each digest blows up into a huge number of intermediate `n2w` terms,     *)
+(*  so the theory never finishes building).  We instead build a dedicated     *)
+(*  `computeLib` compset that loads `wordsLib`'s fast word conversions plus    *)
+(*  exactly the SHA-256 / HMAC / HKDF / key-schedule equations, and discharge *)
+(*  the vectors with `CBV_CONV` over it.  This changes only the *tactic*,     *)
+(*  never a definition, so it cannot affect soundness or the Track 2c         *)
+(*  structural-alignment story.                                               *)
+(* -------------------------------------------------------------------------- *)
+
+val ks_cs = computeLib.new_compset [];
+val _ = wordsLib.add_words_compset true ks_cs;
+val _ = listSimps.list_rws ks_cs;
+val _ = numposrepLib.add_numposrep_compset ks_cs;
+val _ = computeLib.add_thms
+  [ (* SHA-256 core (tls_sha256Theory) *)
+    sha256_digest_def, processBlocks_def, processBlock_def,
+    tls_sha256Theory.schedule_def, extendW_def, compress_round_def,
+    chunk16_def, split16_def, bytes_to_words_def, bytes_to_w32_def,
+    sha_pad_def, padZeros_def, w64_be_bytes_def, w32_be_bytes_def,
+    initState_def, kConstants_def, initHash_def, rotr32_def,
+    sigma0_def, sigma1_def, bigsigma0_def, bigsigma1_def, ch_def, maj_def,
+    (* HMAC + HKDF (tls_sha256Theory) *)
+    tls_sha256Theory.hmac_sha256_def, hmacKey_def, xorPad_def, shaBlockSize_def,
+    hkdf_extract_def, hkdf_expand_def, hkdf_expand_blocks_def,
+    (* key-schedule layer (this theory) *)
+    sha256_def, hmac_sha256_def, hkdfExtract_def, hkdfExpand_def,
+    hkdfExpandLabel_def, buildHkdfLabel_def, deriveSecret_def,
+    earlySecret_def, handshakeSecret_def, masterSecret_def,
+    deriveLabel_def, tls13Prefix_def, hashLen_def, zeros_def,
+    string_to_word8_def, w16_to_bytes_def ] ks_cs;
+
+(* Conversion + tactic that reduce a closed key-schedule term to its bytes.
+   `KS_EVAL` normalises word literals to decimal (`51w`); the goal's RHS is
+   written in hex (`0x33w`).  Rather than depend on a common literal form for
+   `REFL_TAC`, we evaluate the entire boolean equation `lhs = rhs` to `T`
+   (the `wordsLib` compset decides word-list equality), which is insensitive
+   to the hex-vs-decimal surface syntax. *)
+(* Conversion + tactic that discharge a closed key-schedule vector.
+   `KS_EVAL` (fast `wordsLib`-backed compset) reduces the LHS computation to a
+   concrete byte list quickly; a final `EVAL` then decides the resulting
+   all-literal list equality to `T` (insensitive to hex-vs-decimal surface
+   syntax, as both denote the same `n2w` terms).  Only the *tactic* changes;
+   no definition is touched, so soundness and the Track 2c alignment story
+   are unaffected. *)
+val KS_EVAL = computeLib.CBV_CONV ks_cs;
+fun KS_VEC_TAC g = (CONV_TAC (LAND_CONV KS_EVAL) THEN CONV_TAC EVAL) g;
+
+(* These pin the concrete `tls_sha256`-backed key schedule to the published
+   byte vectors of RFC 8448 ("Example Handshake Traces for TLS 1.3").  They
+   are closed by `EVAL` (computation), not by `cheat` -- which is only
+   possible now that `sha256`/`hmac_sha256`/`hkdfExpand` are concrete.
+
+   Both targets are fully determined by constants in this theory (no external
+   transcript needed):
+
+   * Early Secret  = HKDF-Extract(0_32, 0_32)               [RFC 8448 p.4]
+   * Derived (for handshake) = Derive-Secret(EarlySecret, "derived", "")
+     i.e. HKDF-Expand-Label(EarlySecret, "derived", H(""), 32)  [RFC 8448 p.4]
+*)
+
+(* STUB (TDD): asserted first, discharged below. *)
+Theorem rfc8448_early_secret:
+  earlySecret zeros =
+    [0x33w; 0xadw; 0x0aw; 0x1cw; 0x60w; 0x7ew; 0xc0w; 0x3bw;
+     0x09w; 0xe6w; 0xcdw; 0x98w; 0x93w; 0x68w; 0x0cw; 0xe2w;
+     0x10w; 0xadw; 0xf3w; 0x00w; 0xaaw; 0x1fw; 0x26w; 0x60w;
+     0xe1w; 0xb2w; 0x2ew; 0x10w; 0xf1w; 0x70w; 0xf9w; 0x2aw]
+Proof
+  KS_VEC_TAC
+QED
+
+Theorem rfc8448_derived_secret:
+  deriveSecret (earlySecret zeros) deriveLabel [] =
+    [0x6fw; 0x26w; 0x15w; 0xa1w; 0x08w; 0xc7w; 0x02w; 0xc5w;
+     0x67w; 0x8fw; 0x54w; 0xfcw; 0x9dw; 0xbaw; 0xb6w; 0x97w;
+     0x16w; 0xc0w; 0x76w; 0x18w; 0x9cw; 0x48w; 0x25w; 0x0cw;
+     0xebw; 0xeaw; 0xc3w; 0x57w; 0x6cw; 0x36w; 0x11w; 0xbaw]
+Proof
+  KS_VEC_TAC
 QED
 
 val _ = export_theory ();

@@ -12,7 +12,7 @@ spec, the SML implementation (`lib/.../sml-tls/tls.sml`), and the CakeML port
 a real proof. There are **no `cheat`s**, **no `new_axiom`s**, and **no custom
 oracles**. A machine check of the built theories reports:
 
-* `axioms("tls_wire")` = `axioms("tls_keyschedule")` = `axioms("tls_handshake")` = `0`
+* `axioms("tls_wire")` = `axioms("tls_keyschedule")` = `axioms("tls_handshake")` = `axioms("tls_sha256")` = `0`
 * the only oracle tag on any theorem is `DISK_THM` (the benign tag HOL4 puts
   on every theorem serialized to/from disk — it is **not** a trust oracle).
 
@@ -107,22 +107,27 @@ encoders emit), so the round-trip holds unconditionally given `wf<X>`.
 
 ## `tls_keyscheduleTheory` — key schedule (RFC 8446 §7.1, RFC 5869)
 
-### Trusted abstract primitives
+### Concrete primitives (Track 2b)
 
-`sha256`, `hmac_sha256`, and `hkdfExpand` are introduced as **underspecified
-constants** via `new_specification` (a *conservative*, sound extension — the
-existence witnesses are constant-length functions, so **no axiom is added**).
-Only their **output-length contracts** are specified:
+`sha256`, `hmac_sha256`, and `hkdfExpand` are now **concrete, computable
+`Definition`s**, backed by `tls_sha256Theory` — an independent FIPS 180-4 /
+RFC 2104 / RFC 5869 HOL4 implementation (SHA-256 compression over native
+`word32`, HMAC-SHA-256, and HKDF-Extract/Expand). They are ordinary
+definitions, so they add **no axiom and no oracle**; their values are pinned
+down and reducible by `EVAL`.
+
+Their **output-length contracts** are still proved:
 
 * `sha256_length`     : `LENGTH (sha256 bs) = 32`
 * `hmac_sha256_length`: `LENGTH (hmac_sha256 k d) = 32`
 * `hkdfExpand_length` : `LENGTH (hkdfExpand prk info L) = L`
 
-Their *values* are deliberately not pinned down, so nothing false about their
-contents can be derived. **What is assumed and NOT proved:** that these
-constants behave like real SHA-256 / HMAC-SHA-256 / HKDF-Expand, and in
-particular their cryptographic strength (collision/preimage resistance, PRF
-security). That is the crypto trust boundary.
+**What is still assumed and NOT proved:** (1) the *cryptographic strength* of
+SHA-256/HMAC (collision/preimage resistance, PRF security) — that is an
+inherent trust boundary, not a provable property; and (2) that
+`tls_sha256$sha256_digest` is provably **equal** to the CakeML `cakeml/sha256.sml`
+source — it is structurally aligned (same K constants, init vector, padding,
+schedule, compression) but the `ml_translatorLib` equality link is Track 2c.
 
 `hkdfExtract`, `hkdfExpandLabel`, `deriveSecret`, the three Extract stages,
 the traffic/finished keys and `finishedVerifyData` are **defined** exactly as
@@ -130,7 +135,7 @@ RFC 8446 §7.1 / RFC 5869 prescribe in terms of the primitives above.
 
 ### Theorems
 
-Output-length correctness — all **proved (modulo trusted primitive)**:
+Output-length correctness — all **proved**:
 `hkdfExtract_length`, `hkdfExpandLabel_length`, `deriveSecret_length`,
 `earlySecret_length`, `handshakeSecret_length`, `masterSecret_length`,
 `trafficKey_length`, `trafficIv_length`, `finishedKey_length`,
@@ -141,16 +146,23 @@ Structural correctness — **proved**:
   the staged RFC Extract → Derive → Extract chaining prescribes.
 * `schedule_lengths` — every secret in the bundle has the SHA-256 length.
 
-### Not included: RFC 8448 test vectors
+### RFC 8448 test vectors — now discharged by computation (Track 2b)
 
-The original script `cheat`-ed three theorems asserting that the schedule
-equals the published RFC 8448 hex vectors. Those are **removed**: with abstract
-(value-free) primitives they are not provable, and the previous stubs
-(`sha256 = zeros`, `hex_to_word8 = []`) made the equalities *false*, so a
-`cheat` was unsound. Discharging the RFC 8448 vectors requires linking
-`sha256`/`hmac` to a concrete, verified bit-level implementation (e.g. a
-verified SHA-256 from the CakeML tower) and `EVAL`-ing against it. That is the
-intended future refinement and is tracked open work.
+Two RFC 8448 ("Example Handshake Traces for TLS 1.3") key-schedule vectors are
+now **proved by `EVAL`** against the concrete SHA-256, with **no `cheat`**:
+
+* `rfc8448_early_secret`   — `earlySecret zeros` = the published 32-byte Early
+  Secret `HKDF-Extract(0_32, 0_32)`.
+* `rfc8448_derived_secret` — `deriveSecret (earlySecret zeros) "derived" []` =
+  the published 32-byte derived-for-handshake secret.
+
+These are closed by a tuned `computeLib` compset (`wordsLib` fast word
+conversions + the SHA-256/HMAC/HKDF/key-schedule equations) followed by a
+final `EVAL` to decide the literal equality. Bare `EVAL` alone does not finish
+on the 64-round SHA-256 core; the fast compset reduces it in seconds. Both
+theorems carry only the benign `DISK_THM` tag (no oracle). Vectors that depend
+on a full transcript hash (handshake/master/application secrets) still require
+the transcript bytes and are tracked as remaining work alongside Track 2c.
 
 ---
 
@@ -205,11 +217,14 @@ Reachability + inductive safety invariants:
 The HOL4 theorems above rely on **no axioms** and **no proof oracles**. The
 genuine trust assumptions are:
 
-1. **Cryptographic primitives.** `sha256`, `hmac_sha256`, `hkdfExpand` are
-   abstract, specified only by output length. Their cryptographic security
-   (collision resistance of SHA-256, PRF/HMAC security, etc.) and the
-   correctness of AES-GCM / ChaCha20-Poly1305 / X25519 are **assumed, not
-   proved**. None of these is mechanized here.
+1. **Cryptographic primitives.** `sha256`, `hmac_sha256`, `hkdfExpand` are now
+   **concrete, computable** HOL4 definitions (`tls_sha256Theory`), so the key
+   schedule reduces to actual bytes and the RFC 8448 vectors are discharged by
+   computation. What remains **assumed, not proved** is (a) their
+   *cryptographic security* (collision resistance of SHA-256, PRF/HMAC
+   security, etc.), and (b) the correctness of AES-GCM / ChaCha20-Poly1305 /
+   X25519. The `ml_translatorLib` equality between `tls_sha256` and the CakeML
+   `cakeml/sha256.sml` source is Track 2c (structural alignment holds today).
 2. **Length-bound side conditions** on the wire round-trips (listed per
    theorem). These are honest consequences of the on-the-wire length fields.
 
@@ -226,9 +241,10 @@ There is **no mechanized refinement proof** linking the HOL4 spec to the SML
   now modeled in HOL4 with proved round-trips (under `wf<X>` bounds), but they
   are still an *independent re-modeling* aligned with `tls.sml` by inspection —
   not proved equal to the SML functions.
-* The key schedule matches the RFC *structurally*; it is not validated against
-  the RFC 8448 byte vectors (needs concrete crypto), and is not proved to match
-  the SML `TlsKeySchedule` module.
+* The key schedule matches the RFC *structurally* and is now validated against
+  two RFC 8448 byte vectors (`rfc8448_early_secret`, `rfc8448_derived_secret`)
+  by computation against a concrete SHA-256; it is not yet proved to match the
+  SML `TlsKeySchedule` module (that mechanized refinement is Track 2c).
 * The handshake theory is an *abstract* state machine. It captures ordering and
   the Finished-before-Connected/AppData safety property, but does not model
   message contents, key installation, or the full server-flight granularity,
