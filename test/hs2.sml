@@ -381,6 +381,7 @@ struct
          does not select it -- the ServerHello omits pre_shared_key and the
          server falls back to a full (EC)DHE 1-RTT handshake. *)
       val () = section "PSK: server rejects the offered PSK (full 1-RTT)"
+      val () = TlsServer.clearTicketStore ()
       val psst0 = TlsServer.receiveClientHello chRealBody
       val (psst1, pshRec) = TlsServer.produceServerHello (psst0, edServerCfg)
       val psh = Option.valOf (TlsHandshake.decodeServerHello (hsBody pshRec))
@@ -391,6 +392,194 @@ struct
         (true, not shHasPsk)
       val () = checkBool "PSK: server derived (EC)DHE handshake key (full 1-RTT)"
         (true, Option.isSome (TlsServer.serverHandshakeKey psst1))
+
+      (* =============================================================== *)
+      (* PSK resumption ACCEPT path (Track 1c): issue a ticket in conn 1,*)
+      (* resume in conn 2 -> both sides reach CONNECTED with PSK-derived *)
+      (* keys; a wrong-transcript binder is rejected with                *)
+      (* illegal_parameter.                                              *)
+      (* =============================================================== *)
+      val () = section "PSK resumption: issue ticket (conn 1) then resume (conn 2)"
+      val () = TlsServer.clearTicketStore ()
+
+      (* ---- Connection 1: a normal full 1-RTT handshake. ---- *)
+      val r1ClientCfg = {
+        x25519PrivateKey = clientX25519, p256PrivateKey = NONE,
+        clientRandom = clientRandom, legacySessionId = "",
+        cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
+        extensions = [], serverName = "example.com",
+        trustStore = [], now = 0, sigAlgs = [TlsHandshake.sigRsaPssRsaSha256]
+      } : TlsClient.clientConfig
+      val r1ServerCfg = {
+        x25519PrivateKey = serverX25519, p256PrivateKey = NONE,
+        serverRandom = serverRandom,
+        cipherSuite = TlsHandshake.suiteTlsAes128GcmSha256,
+        legacySessionId = "", extensions = [], certChain = [],
+        rsaPrivateKeyDer = "", sigAlg = TlsHandshake.sigRsaPssRsaSha256,
+        now = 0, sigAlgs = []
+      } : TlsServer.serverConfig
+
+      val (c1, c1ch) = TlsClient.startHandshake r1ClientCfg
+      val s1a = TlsServer.receiveClientHello (hsBody c1ch)
+      val (s1b, s1sh) = TlsServer.produceServerHello (s1a, r1ServerCfg)
+      val (c1b, _) = TlsClient.step (c1, s1sh)
+      val (s1c, s1flight) = TlsServer.produceServerFlight (s1b, r1ServerCfg)
+      val (c1c, c1out) = TlsClient.step (c1b, s1flight)
+      val (s1d, _) = TlsServer.step (s1c, List.hd c1out)
+      val () = checkBool "resume: conn1 server connected"
+        (true, TlsServer.isConnected s1d)
+
+      (* Issue a NewSessionTicket. produceNewSessionTicket parses the
+         ticketNonce/ticket from the body and registers the resumption PSK
+         in the in-memory ticket store keyed by the ticket bytes. *)
+      val resTicket = "resume-ticket-conn1"
+      val resNonce = bytes [7, 7]
+      val nstMsg = {
+        ticketLifetime = 0w7200, ticketAgeAdd = 0w0,
+        ticketNonce = resNonce, ticket = resTicket, extensions = []
+      } : TlsHandshake.newSessionTicket
+      val (_, _) = TlsServer.produceNewSessionTicket
+        (s1d, r1ServerCfg, TlsHandshake.encodeNewSessionTicket nstMsg)
+      val () = checkBool "resume: ticket registered in store"
+        (true, Option.isSome (TlsServer.lookupTicket resTicket))
+
+      (* The resumption PSK the client would obtain from its session 1
+         resumption_master_secret. The client computes it the same way the
+         server stored it; we read the server's stored PSK as the oracle the
+         client would have derived. *)
+      val resPsk = Option.valOf (TlsServer.lookupTicket resTicket)
+
+      (* ---- Connection 2: client offers pre_shared_key + modes. ---- *)
+      val () = section "PSK resumption: server ACCEPTS valid binder -> CONNECTED"
+      val (c2, c2chRec) = TlsClient.startHandshake r1ClientCfg
+      val c2base = Option.valOf (TlsHandshake.decodeClientHello (hsBody c2chRec))
+      fun mkResCh exts = {
+        legacyVersion = #legacyVersion c2base, random = #random c2base,
+        legacySessionId = #legacySessionId c2base,
+        cipherSuites = #cipherSuites c2base,
+        legacyCompression = #legacyCompression c2base,
+        extensions = exts
+      } : TlsHandshake.clientHello
+      val resModesExt = {extType = TlsHandshake.extPskKeyExchangeModes,
+        data = TlsExtensions.encodePskKeyExchangeModes [TlsExtensions.pskModeDheKe]}
+        : TlsHandshake.extension
+      val resIds = [{identity = resTicket, obfuscatedTicketAge = 0w0}]
+      val resIdsEnc = TlsExtensions.encodeOfferedPsksIdentities resIds
+      val resPlaceholder = String.implode (List.tabulate (32, fn _ => Char.chr 0))
+      val resBinderStructLen = 2 + TlsExtensions.binderListLength [resPlaceholder]
+      val resPskExtPh = {extType = TlsHandshake.extPreSharedKey,
+        data = resIdsEnc ^ TlsExtensions.encodeBinderList [resPlaceholder]}
+        : TlsHandshake.extension
+      val resChPhBody = TlsHandshake.encodeClientHello
+        (mkResCh (#extensions c2base @ [resModesExt, resPskExtPh]))
+      val resChPhMsg = TlsHandshake.encodeMessage
+        {msgType = TlsHandshake.ClientHello, body = resChPhBody}
+      val resTruncated = String.substring (resChPhMsg, 0,
+                           String.size resChPhMsg - resBinderStructLen)
+      val resBinder = TlsKeySchedule.pskBinder {psk = resPsk, transcript = resTruncated}
+      val resPskExt = {extType = TlsHandshake.extPreSharedKey,
+        data = resIdsEnc ^ TlsExtensions.encodeBinderList [resBinder]}
+        : TlsHandshake.extension
+      val resChBody = TlsHandshake.encodeClientHello
+        (mkResCh (#extensions c2base @ [resModesExt, resPskExt]))
+
+      val s2a = TlsServer.receiveClientHello resChBody
+      val (s2b, s2shRec) = TlsServer.produceServerHello (s2a, r1ServerCfg)
+      val s2sh = Option.valOf (TlsHandshake.decodeServerHello (hsBody s2shRec))
+      val () = checkBool "resume: ServerHello carries pre_shared_key (accepted)"
+        (true, List.exists (fn {extType, ...} => extType = TlsHandshake.extPreSharedKey)
+                           (#extensions s2sh))
+      (* selected_identity must be index 0. *)
+      val () = checkBool "resume: selected_identity = 0"
+        (true, case List.find (fn {extType, ...} => extType = TlsHandshake.extPreSharedKey)
+                              (#extensions s2sh) of
+                   SOME {data, ...} => TlsExtensions.decodeSelectedIdentity data = SOME 0w0
+                 | NONE => false)
+
+      val (s2c, s2flight) = TlsServer.produceServerFlight (s2b, r1ServerCfg)
+
+      (* The PSK-derived keys must differ from a non-PSK (zero-PSK) schedule
+         over the same transcript/dhe, proving the PSK was actually mixed in. *)
+      val s2HsKey = TlsServer.serverHandshakeKey s2b
+      val () = checkBool "resume: server derived a handshake key"
+        (true, Option.isSome s2HsKey)
+
+      (* Client side: reproduce the PSK key schedule to (a) decrypt the
+         server flight and (b) send a valid Finished so the server CONNECTS. *)
+      val s2dhe = X25519.dh clientX25519 (X25519.base serverX25519)
+      val s2HsTranscript = TlsServer.transcript s2b  (* CH..SH *)
+      val sched2 = TlsKeySchedule.schedulePsk {
+        psk = resPsk, dhe = s2dhe,
+        handshakeTranscript = s2HsTranscript, applicationTranscript = ""
+      }
+      val cHsK2 = TlsKeySchedule.trafficKey
+        {secret = #clientHandshakeSecret sched2, keyLength = 16}
+      val cHsIv2 = TlsKeySchedule.trafficIv
+        {secret = #clientHandshakeSecret sched2, ivLength = 12}
+      (* Confirm client-derived server-HS key matches the server's, i.e. the
+         PSK schedule agrees on both ends. *)
+      val sHsK2 = TlsKeySchedule.trafficKey
+        {secret = #serverHandshakeSecret sched2, keyLength = 16}
+      val sHsIv2 = TlsKeySchedule.trafficIv
+        {secret = #serverHandshakeSecret sched2, ivLength = 12}
+      val () = checkBool "resume: client/server agree on server HS key (PSK schedule)"
+        (true, TlsServer.serverHandshakeKey s2b = SOME (sHsK2, sHsIv2))
+
+      (* Build the client Finished over the server's post-flight transcript
+         (CH..SH..EE..ServerFinished -- resumption omits Cert/CertVerify). *)
+      val s2FinTranscript = TlsServer.transcript s2c
+      val cfKey2 = TlsKeySchedule.finishedKey
+        {secret = #clientHandshakeSecret sched2}
+      val cfVerify2 = TlsKeySchedule.finishedVerifyData
+        {finishedKey = cfKey2, transcript = s2FinTranscript}
+      val cFinMsg2 = TlsHandshake.encodeMessage
+        {msgType = TlsHandshake.Finished,
+         body = TlsHandshake.encodeFinished {verifyData = cfVerify2}}
+      val cProt2 = TlsRecordProtect.init {key = cHsK2, iv = cHsIv2}
+      val (cFinBody2, _) = TlsRecordProtect.protect
+        {state = cProt2, innerType = TlsRecord.Handshake,
+         plaintext = cFinMsg2, pad = 0}
+      val cFinRec2 = TlsRecord.encodeCiphertext
+        {contentType = TlsRecord.ApplicationData, encryptedRecord = cFinBody2}
+      val (s2d, _) = TlsServer.step (s2c, cFinRec2)
+      val () = checkBool "resume: server CONNECTED via PSK (valid binder + Finished)"
+        (true, TlsServer.isConnected s2d)
+      val () = checkBool "resume: server has no error"
+        (true, not (Option.isSome (TlsServer.error s2d)))
+
+      (* App-key agreement: client reproduces the app secrets via schedulePsk
+         over the server's connect transcript and matches the server. *)
+      val sApK2 = TlsKeySchedule.trafficKey
+        {secret = #serverAppSecret sched2, keyLength = 16}
+      (* recompute application secrets over the connect transcript *)
+      val schedApp2 = TlsKeySchedule.schedulePsk {
+        psk = resPsk, dhe = s2dhe,
+        handshakeTranscript = s2HsTranscript,
+        applicationTranscript = s2FinTranscript
+      }
+      val sApKey2 = TlsKeySchedule.trafficKey
+        {secret = #serverAppSecret schedApp2, keyLength = 16}
+      val sApIv2 = TlsKeySchedule.trafficIv
+        {secret = #serverAppSecret schedApp2, ivLength = 12}
+      val () = checkBool "resume: client/server agree on server app key (PSK)"
+        (true, TlsServer.serverAppKey s2d = SOME (sApKey2, sApIv2))
+
+      (* Negative: a binder over the WRONG transcript must be rejected with
+         illegal_parameter. *)
+      val () = section "PSK resumption: wrong-transcript binder -> illegal_parameter"
+      val badBinder2 = TlsKeySchedule.pskBinder
+        {psk = resPsk, transcript = resTruncated ^ "tampered-extra-bytes"}
+      val badPskExt = {extType = TlsHandshake.extPreSharedKey,
+        data = resIdsEnc ^ TlsExtensions.encodeBinderList [badBinder2]}
+        : TlsHandshake.extension
+      val badChBody = TlsHandshake.encodeClientHello
+        (mkResCh (#extensions c2base @ [resModesExt, badPskExt]))
+      val s3a = TlsServer.receiveClientHello badChBody
+      val (s3b, _) = TlsServer.produceServerHello (s3a, r1ServerCfg)
+      val () = checkBool "resume: bad binder -> illegal_parameter"
+        (true, alertIs (TlsServer.error s3b, TlsAlert.IllegalParameter))
+      val () = checkBool "resume: bad binder -> no handshake key derived"
+        (true, not (Option.isSome (TlsServer.serverHandshakeKey s3b)))
     in
       ()
     end

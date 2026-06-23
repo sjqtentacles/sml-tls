@@ -91,6 +91,14 @@ certverify.sml
 extensions.sig
 extensions.sml
 
+(* 14b. Track 1b: best-effort secure zeroing of key material. The default
+       build uses the portable pure-SML fallback (secure_zero_pure.sml);
+       the FFI build swaps in secure_zero_ffi.sml (sodium_memzero). Loaded
+       before tlsstate.sml, which calls SecureZero in TlsClient/TlsServer
+       .zeroize. *)
+../sml-crypto-ffi/secure_zero.sig
+../sml-crypto-ffi/secure_zero_pure.sml
+
 (* 14. sml-tls state machine (J1 integration): TlsClient / TlsServer / Tls.
        Loads last so it can call TlsRecordProtect (A1), TlsCertVerify (A2),
        TlsExtensions (A3), and P256 (A4). *)

@@ -905,6 +905,59 @@ struct
   fun isConnected (st : clientState) = #connected st
 
   fun certVerified (st : clientState) = #certVerified st
+
+  (* ---- Track 1b: secure zeroing of client key material ---- *)
+  local
+    fun zStr s = SecureZero.zeroString s
+    fun zOpt NONE = NONE
+      | zOpt (SOME s) = SOME (SecureZero.zeroString s)
+    fun zKey NONE = NONE
+      | zKey (SOME (k, iv)) =
+          SOME (SecureZero.zeroString k, SecureZero.zeroString iv)
+    (* Re-init a record-protection state from a zeroed (key,iv), so the
+       AEAD state no longer references live key bytes. *)
+    fun zProt NONE = NONE
+      | zProt (SOME _) =
+          let val z = SecureZero.zeroString (String.implode (List.tabulate (16, fn _ => #"\000")))
+          in SOME (TlsRecordProtect.init {key = z, iv =
+               SecureZero.zeroString (String.implode (List.tabulate (12, fn _ => #"\000")))}) end
+  in
+    fun zeroize (st : clientState) : clientState =
+      { config = #config st,
+        x25519PrivateKey = zStr (#x25519PrivateKey st),
+        clientHello = #clientHello st,
+        transcript = #transcript st,
+        cipherSuite = #cipherSuite st,
+        dhe = zStr (#dhe st),
+        negotiatedGroup = #negotiatedGroup st,
+        serverHello = #serverHello st,
+        clientHsSecret = zOpt (#clientHsSecret st),
+        serverHsSecret = zOpt (#serverHsSecret st),
+        clientApSecret = zOpt (#clientApSecret st),
+        serverApSecret = zOpt (#serverApSecret st),
+        serverHandshakeKey = zKey (#serverHandshakeKey st),
+        clientHandshakeKey = zKey (#clientHandshakeKey st),
+        serverAppKey = zKey (#serverAppKey st),
+        clientAppKey = zKey (#clientAppKey st),
+        serverHsProtect = zProt (#serverHsProtect st),
+        serverApProtect = zProt (#serverApProtect st),
+        clientApProtect = zProt (#clientApProtect st),
+        certVerified = #certVerified st,
+        errorAlert = #errorAlert st,
+        connected = #connected st }
+  end
+
+  fun secretsForTest (st : clientState) : string list =
+    let
+      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [k, iv]
+      fun ofOpt NONE = [] | ofOpt (SOME s) = [s]
+    in
+      [#x25519PrivateKey st, #dhe st]
+      @ ofOpt (#clientHsSecret st) @ ofOpt (#serverHsSecret st)
+      @ ofOpt (#clientApSecret st) @ ofOpt (#serverApSecret st)
+      @ ofKey (#serverHandshakeKey st) @ ofKey (#clientHandshakeKey st)
+      @ ofKey (#serverAppKey st) @ ofKey (#clientAppKey st)
+    end
 end
 
 structure TlsServer :> TLS_SERVER =
@@ -965,6 +1018,21 @@ struct
   fun mkProtect (cs, (key, iv)) =
     TlsRecordProtect.initWithAlg {key = key, iv = iv, alg = suiteAlg cs}
 
+  (* ---- PSK resumption ticket store (Track 1c) ----
+     An in-memory map from a ticket's opaque identity bytes to the
+     resumption PSK derived from the issuing connection. Populated by
+     produceNewSessionTicket and consulted by produceServerHello. A
+     process-wide ref models a single server's session cache. *)
+  val ticketStore : (string * string) list ref = ref []
+
+  fun clearTicketStore () = ticketStore := []
+
+  fun lookupTicket id =
+    Option.map #2 (List.find (fn (k, _) => k = id) (!ticketStore))
+
+  fun storeTicket (id, psk) =
+    ticketStore := (id, psk) :: List.filter (fn (k, _) => k <> id) (!ticketStore)
+
   (* RFC 8446 §5.2 record_overflow bound (see TlsClient). *)
   val maxCiphertextLen = 16384 + 256
 
@@ -979,6 +1047,21 @@ struct
     TlsRecord.encodePlaintext
       {contentType = TlsRecord.Alert,
        fragment = TlsAlert.encode {level = TlsAlert.Fatal, description = desc}}
+
+  fun setError (st : serverState, desc) : serverState =
+    { x25519PrivateKey = #x25519PrivateKey st, serverRandom = #serverRandom st,
+      cipherSuite = #cipherSuite st, legacySessionId = #legacySessionId st,
+      extensions = #extensions st, transcript = #transcript st, dhe = #dhe st,
+      clientHello = #clientHello st, serverHello = #serverHello st,
+      clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
+      clientApSecret = #clientApSecret st, serverApSecret = #serverApSecret st,
+      serverHandshakeKey = #serverHandshakeKey st,
+      clientHandshakeKey = #clientHandshakeKey st,
+      serverAppKey = #serverAppKey st, clientAppKey = #clientAppKey st,
+      clientHsProtect = #clientHsProtect st, clientApProtect = #clientApProtect st,
+      serverApProtect = #serverApProtect st,
+      errorAlert = SOME (TlsAlert.alertDescriptionToByte desc),
+      connected = #connected st }
 
   fun receiveClientHello (chBody : string) : serverState =
     case TlsHandshake.decodeClientHello chBody of
@@ -1055,6 +1138,78 @@ struct
   fun serverKeyShareExt (group, pub) : TlsHandshake.extension =
     {extType = TlsHandshake.extKeyShare,
      data = TlsExtensions.encodeKeyShareSH {group = group, keyExchange = pub}}
+
+  (* ---- PSK resumption selection (Track 1c, RFC 8446 §4.2.11) ----
+     Examine a ClientHello for pre_shared_key + psk_key_exchange_modes. The
+     server only does psk_dhe_ke (it always negotiates an (EC)DHE share),
+     so psk_key_exchange_modes MUST advertise mode 1. For each offered
+     identity (in order) look it up in the ticket store; the first known
+     identity is the candidate. Then verify its binder MAC over the
+     truncated transcript (the ClientHello up to and excluding the binder
+     list, §4.2.11.2), where `chMsg` is the full ClientHello wire message
+     (handshake header + body).
+
+     Returns:
+       NONE                       -- no usable PSK offered (reject: full 1-RTT)
+       SOME (index, psk)          -- accept PSK at `index` with secret `psk`
+     Raises Fatal IllegalParameter when a known identity's binder does not
+     verify (a protocol violation, §4.2.11.2). *)
+  fun selectPsk (ch : TlsHandshake.clientHello, chMsg : string)
+      : (int * string) option =
+    let
+      val exts = #extensions ch
+      fun findExt t =
+        case List.find (fn {extType, ...} => extType = t) exts of
+            SOME {data, ...} => SOME data
+          | NONE => NONE
+      val modesOk =
+        case findExt TlsHandshake.extPskKeyExchangeModes of
+            SOME d =>
+              (case TlsExtensions.decodePskKeyExchangeModes d of
+                   SOME ms => List.exists (fn m => m = TlsExtensions.pskModeDheKe) ms
+                 | NONE => false)
+          | NONE => false
+    in
+      if not modesOk then NONE
+      else
+        case findExt TlsHandshake.extPreSharedKey of
+            NONE => NONE
+          | SOME pskData =>
+              (case TlsExtensions.decodeOfferedPsks pskData of
+                   NONE => NONE
+                 | SOME (ids, binders) =>
+                     let
+                       (* Find the first offered identity we recognise. *)
+                       fun pick (_, [], _) = NONE
+                         | pick (i, {identity, ...} :: rest, bs) =
+                             (case (lookupTicket identity, bs) of
+                                  (SOME psk, b :: _) => SOME (i, psk, b)
+                                | (SOME _, []) => NONE  (* missing binder *)
+                                | (NONE, _ :: bs') => pick (i + 1, rest, bs')
+                                | (NONE, []) => NONE)
+                     in
+                       case pick (0, ids, binders) of
+                           NONE => NONE
+                         | SOME (idx, psk, clientBinder) =>
+                             let
+                               (* Truncate(ClientHello): drop the binder
+                                  list (2-byte length prefix + entries).
+                                  The binder list is the LAST thing in the
+                                  pre_shared_key extension, which is the
+                                  LAST extension, so it is the tail of the
+                                  ClientHello wire message. *)
+                               val binderStructLen =
+                                 2 + TlsExtensions.binderListLength binders
+                               val truncated = String.substring
+                                 (chMsg, 0, String.size chMsg - binderStructLen)
+                               val expected = TlsKeySchedule.pskBinder
+                                 {psk = psk, transcript = truncated}
+                             in
+                               if expected = clientBinder then SOME (idx, psk)
+                               else raise Fatal TlsAlert.IllegalParameter
+                             end
+                     end)
+    end
 
   (* Emit a HelloRetryRequest (RFC 8446 §4.1.4) forcing the client to retry
      with a key_share for `group`, optionally carrying a `cookie`. Applies
@@ -1142,6 +1297,14 @@ struct
       val ch = case #clientHello st of
                    NONE => raise Tls "no ClientHello"
                  | SOME c => c
+      (* The full ClientHello wire message, for the PSK binder transcript
+         truncation (§4.2.11.2). For a non-HRR handshake the server
+         transcript IS exactly this message. *)
+      val chMsg = TlsHandshake.encodeMessage
+        {msgType = TlsHandshake.ClientHello, body = TlsHandshake.encodeClientHello ch}
+      (* PSK resumption decision (verifies the binder; raises Fatal
+         IllegalParameter on a known-identity binder mismatch). *)
+      val pskSel = selectPsk (ch, chMsg)
       val shares = clientKeyShares ch
       val group =
         case TlsExtensions.negotiateGroup
@@ -1155,7 +1318,16 @@ struct
       val (serverPub, dhe) = serverShareAndDhe (cfg, group, peerPub)
       val keyShare = serverKeyShareExt (group, serverPub)
       val supVer = supportedVersionsServerExt ()
-      val exts = List.concat [#extensions cfg, [keyShare, supVer]]
+      (* On PSK accept, echo selected_identity (§4.2.11). The pre_shared_key
+         extension MUST be last in the ServerHello. *)
+      val pskExtSH =
+        case pskSel of
+            SOME (idx, _) =>
+              [{extType = TlsHandshake.extPreSharedKey,
+                data = TlsExtensions.encodeSelectedIdentity (Word16.fromInt idx)}
+               : TlsHandshake.extension]
+          | NONE => []
+      val exts = List.concat [#extensions cfg, [keyShare, supVer], pskExtSH]
       val sh = {
         legacyVersion = 0wx0303,
         random = #serverRandom cfg,
@@ -1168,11 +1340,18 @@ struct
       val shMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.ServerHello, body = shBody}
       val transcript = #transcript st ^ shMsg
-      val sched = TlsKeySchedule.schedule {
-        dhe = dhe,
-        handshakeTranscript = transcript,
-        applicationTranscript = ""
-      }
+      (* PSK resumption seeds the Early-Secret with the resumption PSK
+         (psk_dhe_ke); a full handshake uses a zero PSK. *)
+      val sched =
+        case pskSel of
+            SOME (_, psk) =>
+              TlsKeySchedule.schedulePsk {
+                psk = psk, dhe = dhe,
+                handshakeTranscript = transcript, applicationTranscript = ""}
+          | NONE =>
+              TlsKeySchedule.schedule {
+                dhe = dhe,
+                handshakeTranscript = transcript, applicationTranscript = ""}
       val cs = #cipherSuite cfg
       val (keyLen, ivLen) =
         if cs = TlsHandshake.suiteTlsAes128GcmSha256 orelse
@@ -1216,6 +1395,7 @@ struct
     in
       (st', record)
     end
+    handle Fatal desc => (setError (st, desc), alertRecord desc)
 
   (* Encode the inner EncryptedExtensions, Certificate, CertificateVerify and
      server Finished, then AEAD-protect each as its own record under the
@@ -1229,6 +1409,28 @@ struct
       val (keyLen, ivLen) = suiteKeyIvLen cs
       val serverHsSecret = Option.valOf (#serverHsSecret st)
       val sHsKiv = Option.valOf (#serverHandshakeKey st)
+      (* PSK resumption: a handshake authenticated by the PSK omits the
+         server Certificate / CertificateVerify (RFC 8446 §2.2, §4.4.2) and
+         seeds all secrets with the resumption PSK. Detect acceptance from
+         the stored ServerHello (carries pre_shared_key) and recover the PSK
+         by re-running the (idempotent, binder-verified) selection over the
+         stored ClientHello. *)
+      val resumePsk =
+        case #serverHello st of
+            SOME sh =>
+              if List.exists
+                   (fn {extType, ...} => extType = TlsHandshake.extPreSharedKey)
+                   (#extensions sh)
+              then
+                (case #clientHello st of
+                     SOME ch =>
+                       let val chMsg = TlsHandshake.encodeMessage
+                             {msgType = TlsHandshake.ClientHello,
+                              body = TlsHandshake.encodeClientHello ch}
+                       in Option.map #2 (selectPsk (ch, chMsg)) end
+                   | NONE => NONE)
+              else NONE
+          | NONE => NONE
       (* EncryptedExtensions: empty extension block for this minimal server. *)
       val eeBody = TlsHandshake.encodeEncryptedExtensions []
       val eeMsg = TlsHandshake.encodeMessage
@@ -1258,8 +1460,10 @@ struct
         {sigAlg = #sigAlg cfg, sigBytes = cvSigBytes}
       val cvMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.CertificateVerify, body = cvBody}
-      (* Server Finished over the transcript through CertificateVerify. *)
-      val tBeforeFin = tBeforeCv ^ cvMsg
+      (* On PSK resumption, the flight is EE..ServerFinished (no Cert/CV). *)
+      val isResume = Option.isSome resumePsk
+      val tBeforeFin =
+        if isResume then #transcript st ^ eeMsg else tBeforeCv ^ cvMsg
       val sfKey = TlsKeySchedule.finishedKey {secret = serverHsSecret}
       val sfVerify = TlsKeySchedule.finishedVerifyData
         {finishedKey = sfKey, transcript = tBeforeFin}
@@ -1267,12 +1471,18 @@ struct
       val sfMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.Finished, body = sfBody}
       val transcript' = tBeforeFin ^ sfMsg
-      (* Application-traffic keys from the transcript through server Finished. *)
-      val sched = TlsKeySchedule.schedule {
-        dhe = #dhe st,
-        handshakeTranscript = #transcript st,
-        applicationTranscript = transcript'
-      }
+      (* Application-traffic keys from the transcript through server Finished;
+         seed with the resumption PSK when resuming. *)
+      val sched =
+        case resumePsk of
+            SOME psk => TlsKeySchedule.schedulePsk {
+              psk = psk, dhe = #dhe st,
+              handshakeTranscript = #transcript st,
+              applicationTranscript = transcript'}
+          | NONE => TlsKeySchedule.schedule {
+              dhe = #dhe st,
+              handshakeTranscript = #transcript st,
+              applicationTranscript = transcript'}
       val sApSec = #serverAppSecret sched
       val cApSec = #clientAppSecret sched
       val sApKey = TlsKeySchedule.trafficKey {secret = sApSec, keyLength = keyLen}
@@ -1290,10 +1500,15 @@ struct
         end
       val p0 = mkProtect (cs, sHsKiv)
       val (p1, r1) = emit (p0, eeMsg)
-      val (p2, r2) = emit (p1, certMsg)
-      val (p3, r3) = emit (p2, cvMsg)
-      val (_,  r4) = emit (p3, sfMsg)
-      val flight = r1 ^ r2 ^ r3 ^ r4
+      val flight =
+        if isResume then
+          let val (_, r4) = emit (p1, sfMsg) in r1 ^ r4 end
+        else
+          let
+            val (p2, r2) = emit (p1, certMsg)
+            val (p3, r3) = emit (p2, cvMsg)
+            val (_,  r4) = emit (p3, sfMsg)
+          in r1 ^ r2 ^ r3 ^ r4 end
       val st' = {
         x25519PrivateKey = #x25519PrivateKey st,
         serverRandom = #serverRandom st,
@@ -1337,6 +1552,32 @@ struct
                plaintext = nstMsg, pad = 0}
             val record = TlsRecord.encodeCiphertext
               {contentType = TlsRecord.ApplicationData, encryptedRecord = body}
+            (* Register the resumption PSK in the ticket store, keyed by the
+               ticket's opaque identity bytes (RFC 8446 §4.6.1 / §7.1).
+                 resumption_master_secret = Derive-Secret(Master, "res master",
+                     ClientHello..client Finished)
+                 PSK = HKDF-Expand-Label(res_master, "resumption", ticketNonce)
+               The master secret depends only on (EC)DHE (zero PSK on the
+               issuing full handshake); the resumption master secret binds the
+               complete handshake transcript held in #transcript at this point
+               (through the client Finished). *)
+            val () =
+              case TlsHandshake.decodeNewSessionTicket nstBody of
+                  SOME {ticket, ticketNonce, ...} =>
+                    if ticket = "" then ()
+                    else
+                      let
+                        val ms = #masterSecret (TlsKeySchedule.schedule
+                          {dhe = #dhe st, handshakeTranscript = "",
+                           applicationTranscript = ""})
+                        val rms = TlsKeySchedule.resumptionMasterSecret
+                          {masterSecret = ms, transcript = #transcript st}
+                        val psk = TlsKeySchedule.resumptionPsk
+                          {resumptionMasterSecret = rms, ticketNonce = ticketNonce}
+                      in
+                        storeTicket (ticket, psk)
+                      end
+                | NONE => ()
             val st' = {
               x25519PrivateKey = #x25519PrivateKey st,
               serverRandom = #serverRandom st,
@@ -1404,21 +1645,6 @@ struct
         serverApProtect = #serverApProtect st, errorAlert = #errorAlert st,
         connected = #connected st }
     end
-
-  fun setError (st : serverState, desc) : serverState =
-    { x25519PrivateKey = #x25519PrivateKey st, serverRandom = #serverRandom st,
-      cipherSuite = #cipherSuite st, legacySessionId = #legacySessionId st,
-      extensions = #extensions st, transcript = #transcript st, dhe = #dhe st,
-      clientHello = #clientHello st, serverHello = #serverHello st,
-      clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
-      clientApSecret = #clientApSecret st, serverApSecret = #serverApSecret st,
-      serverHandshakeKey = #serverHandshakeKey st,
-      clientHandshakeKey = #clientHandshakeKey st,
-      serverAppKey = #serverAppKey st, clientAppKey = #clientAppKey st,
-      clientHsProtect = #clientHsProtect st, clientApProtect = #clientApProtect st,
-      serverApProtect = #serverApProtect st,
-      errorAlert = SOME (TlsAlert.alertDescriptionToByte desc),
-      connected = #connected st }
 
   (* Mark the server connected (after receiving the client Finished). *)
   fun markConnected (st : serverState) : serverState =
@@ -1549,6 +1775,73 @@ struct
   fun clientAppKey (st : serverState) = #clientAppKey st
   fun transcript (st : serverState) = #transcript st
   fun isConnected (st : serverState) = #connected st
+
+  (* ---- Track 1b: secure zeroing of server key material ---- *)
+  local
+    fun zStr s = SecureZero.zeroString s
+    fun zOpt NONE = NONE
+      | zOpt (SOME s) = SOME (SecureZero.zeroString s)
+    fun zKey NONE = NONE
+      | zKey (SOME (k, iv)) =
+          SOME (SecureZero.zeroString k, SecureZero.zeroString iv)
+    fun zProt NONE = NONE
+      | zProt (SOME _) =
+          SOME (TlsRecordProtect.init
+            {key = SecureZero.zeroString (String.implode (List.tabulate (16, fn _ => #"\000"))),
+             iv = SecureZero.zeroString (String.implode (List.tabulate (12, fn _ => #"\000")))})
+  in
+    fun zeroize (st : serverState) : serverState =
+      { x25519PrivateKey = zStr (#x25519PrivateKey st),
+        serverRandom = #serverRandom st,
+        cipherSuite = #cipherSuite st,
+        legacySessionId = #legacySessionId st,
+        extensions = #extensions st,
+        transcript = #transcript st,
+        dhe = zStr (#dhe st),
+        clientHello = #clientHello st,
+        serverHello = #serverHello st,
+        clientHsSecret = zOpt (#clientHsSecret st),
+        serverHsSecret = zOpt (#serverHsSecret st),
+        clientApSecret = zOpt (#clientApSecret st),
+        serverApSecret = zOpt (#serverApSecret st),
+        serverHandshakeKey = zKey (#serverHandshakeKey st),
+        clientHandshakeKey = zKey (#clientHandshakeKey st),
+        serverAppKey = zKey (#serverAppKey st),
+        clientAppKey = zKey (#clientAppKey st),
+        clientHsProtect = zProt (#clientHsProtect st),
+        clientApProtect = zProt (#clientApProtect st),
+        serverApProtect = zProt (#serverApProtect st),
+        errorAlert = #errorAlert st,
+        connected = #connected st }
+  end
+
+  fun zeroizeConfig (cfg : serverConfig) : serverConfig =
+    { x25519PrivateKey = SecureZero.zeroString (#x25519PrivateKey cfg),
+      p256PrivateKey =
+        (case #p256PrivateKey cfg of
+             NONE => NONE
+           | SOME s => SOME (SecureZero.zeroString s)),
+      serverRandom = #serverRandom cfg,
+      cipherSuite = #cipherSuite cfg,
+      legacySessionId = #legacySessionId cfg,
+      extensions = #extensions cfg,
+      certChain = #certChain cfg,
+      rsaPrivateKeyDer = SecureZero.zeroString (#rsaPrivateKeyDer cfg),
+      sigAlg = #sigAlg cfg,
+      now = #now cfg,
+      sigAlgs = #sigAlgs cfg }
+
+  fun secretsForTest (st : serverState) : string list =
+    let
+      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [k, iv]
+      fun ofOpt NONE = [] | ofOpt (SOME s) = [s]
+    in
+      [#x25519PrivateKey st, #dhe st]
+      @ ofOpt (#clientHsSecret st) @ ofOpt (#serverHsSecret st)
+      @ ofOpt (#clientApSecret st) @ ofOpt (#serverApSecret st)
+      @ ofKey (#serverHandshakeKey st) @ ofKey (#clientHandshakeKey st)
+      @ ofKey (#serverAppKey st) @ ofKey (#clientAppKey st)
+    end
 end
 
 structure Tls :> TLS =

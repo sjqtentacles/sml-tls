@@ -6,6 +6,7 @@ fun runAllSuites () =
   ; ExtTests.run ()
   ; Hs2Tests.run ()
   ; HardenTests.run ()
+  ; ZeroizeTests.run ()
   ; Harness.run () )
 
 fun main () =

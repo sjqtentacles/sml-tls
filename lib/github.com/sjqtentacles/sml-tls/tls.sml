@@ -929,4 +929,23 @@ struct
        clientHandshakeSecret = cHs, serverHandshakeSecret = sHs,
        clientAppSecret = cAp, serverAppSecret = sAp}
     end
+
+  fun schedulePsk {psk, dhe, handshakeTranscript, applicationTranscript} =
+    let
+      val es = earlySecret {psk = psk}
+      val hs = handshakeSecret {earlySecret = es, dhe = dhe}
+      val ms = masterSecret {handshakeSecret = hs}
+      val cHs = deriveSecret {secret = hs, label = "c hs traffic",
+                              transcript = handshakeTranscript}
+      val sHs = deriveSecret {secret = hs, label = "s hs traffic",
+                              transcript = handshakeTranscript}
+      val cAp = deriveSecret {secret = ms, label = "c ap traffic",
+                              transcript = applicationTranscript}
+      val sAp = deriveSecret {secret = ms, label = "s ap traffic",
+                              transcript = applicationTranscript}
+    in
+      {earlySecret = es, handshakeSecret = hs, masterSecret = ms,
+       clientHandshakeSecret = cHs, serverHandshakeSecret = sHs,
+       clientAppSecret = cAp, serverAppSecret = sAp}
+    end
 end

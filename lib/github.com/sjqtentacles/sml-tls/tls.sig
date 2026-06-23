@@ -368,6 +368,15 @@ sig
                   handshakeTranscript : string,
                   applicationTranscript : string} -> keySchedule
 
+  (* As `schedule`, but seeds the Early-Secret with a resumption `psk`
+     (rather than a zero PSK) for a psk_dhe_ke resumption handshake
+     (RFC 8446 §2.2 / §4.2.11). With `psk = zeros` it is identical to
+     `schedule`. *)
+  val schedulePsk : {psk : string,
+                     dhe : string,
+                     handshakeTranscript : string,
+                     applicationTranscript : string} -> keySchedule
+
   (* The 64-byte "finished" input content string prefix used in
      CertificateVerify (§4.4.3): 64 space characters. *)
   val certificateVerifyPrefix : string
@@ -512,6 +521,23 @@ sig
   val certVerified : clientState -> bool
   (* The fatal alert description byte that terminated the connection, if any. *)
   val error : clientState -> Word8.word option
+
+  (* Track 1b: best-effort secure wipe of all secret material held by the
+     state -- the client X25519 private key, the ECDHE shared secret, every
+     handshake/application traffic secret, and the derived (key,iv) traffic
+     keys. Returns a new state with those fields overwritten by zeros,
+     wiping the scratch buffers via SecureZero (sodium_memzero in the FFI
+     build, a portable Word8Array wipe otherwise).
+
+     HONEST CAVEAT: SML strings are immutable and the GC may have already
+     copied these secrets elsewhere; this zeros the buffers we control and
+     the returned state, but cannot guarantee no copy of the original
+     bytes survives in the heap. Callers should drop the old state. *)
+  val zeroize : clientState -> clientState
+
+  (* Test-only accessor: every secret byte string the state holds, so a
+     test can assert they are all zero after `zeroize`. *)
+  val secretsForTest : clientState -> string list
 end
 
 signature TLS_SERVER =
@@ -587,6 +613,34 @@ sig
   val transcript : serverState -> string
   val isConnected : serverState -> bool
   val error : serverState -> Word8.word option
+
+  (* Track 1b: best-effort secure wipe of secret material in the state --
+     the server X25519 private key, the ECDHE shared secret, every
+     handshake/application traffic secret, and the derived (key,iv) traffic
+     keys. Returns a new state with those fields zeroed. Same immutability
+     caveat as TlsClient.zeroize. *)
+  val zeroize : serverState -> serverState
+
+  (* The server's long-term RSA private key lives in `serverConfig`
+     (`rsaPrivateKeyDer`), not the per-connection state, so it is wiped
+     separately: returns a config with `rsaPrivateKeyDer` overwritten by
+     zeros. Same immutability caveat. *)
+  val zeroizeConfig : serverConfig -> serverConfig
+
+  (* Test-only accessor: every secret byte string the state holds. *)
+  val secretsForTest : serverState -> string list
+
+  (* ---- PSK resumption (Track 1c, RFC 8446 §4.2.11 / §7.1) ----
+     The server keeps an in-memory ticket store mapping a ticket's opaque
+     identity bytes to the resumption PSK derived from it.
+     `produceNewSessionTicket` registers an entry; `produceServerHello`
+     consults the store, verifies the binder, and on success runs the PSK
+     key schedule (selected_identity echoed in the ServerHello).
+
+     `clearTicketStore` empties the store (used by tests for isolation);
+     `lookupTicket id` returns the registered resumption PSK for `id`. *)
+  val clearTicketStore : unit -> unit
+  val lookupTicket : string -> string option
 end
 
 signature TLS =

@@ -9,5 +9,6 @@ cert.sml
 ext.sml
 hs2.sml
 harden.sml
+zeroize.sml
 entry.sml
 main.sml
