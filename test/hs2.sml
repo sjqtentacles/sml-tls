@@ -210,7 +210,7 @@ struct
       (* The server's EncryptedExtensions must NOT echo early_data: that
          omission is the reject signal (§4.2.10). *)
       val (shsK, shsIv) = Option.valOf (TlsServer.serverHandshakeKey esst1)
-      val eeProt = TlsRecordProtect.init {key = shsK, iv = shsIv}
+      val eeProt = TlsRecordProtect.init {key = Secret.fromString shsK, iv = Secret.fromString shsIv}
       val eeHasEarlyData =
         case TlsRecord.decodeCiphertext eflight of
             SOME (crec, _) =>
@@ -251,7 +251,7 @@ struct
       val (chsK, chsIv) = Option.valOf (TlsClient.clientHandshakeKey ecst1)
       val finPlain =
         case TlsRecordProtect.unprotect
-               {state = TlsRecordProtect.init {key = chsK, iv = chsIv},
+               {state = TlsRecordProtect.init {key = Secret.fromString chsK, iv = Secret.fromString chsIv},
                 record = (case TlsRecord.decodeCiphertext finishedRecord of
                               SOME (r, _) => #encryptedRecord r
                             | NONE => raise Fail "finishedRecord")} of
@@ -259,7 +259,7 @@ struct
           | NONE => raise Fail "decrypt client Finished"
       val eoedMsg = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.EndOfEarlyData, body = ""}
-      val prot0 = TlsRecordProtect.init {key = chsK, iv = chsIv}
+      val prot0 = TlsRecordProtect.init {key = Secret.fromString chsK, iv = Secret.fromString chsIv}
       val (eoedBody, prot1) = TlsRecordProtect.protect
         {state = prot0, innerType = TlsRecord.Handshake, plaintext = eoedMsg, pad = 0}
       val (finBody2, _) = TlsRecordProtect.protect
@@ -535,7 +535,7 @@ struct
       val cFinMsg2 = TlsHandshake.encodeMessage
         {msgType = TlsHandshake.Finished,
          body = TlsHandshake.encodeFinished {verifyData = cfVerify2}}
-      val cProt2 = TlsRecordProtect.init {key = cHsK2, iv = cHsIv2}
+      val cProt2 = TlsRecordProtect.init {key = Secret.fromString cHsK2, iv = Secret.fromString cHsIv2}
       val (cFinBody2, _) = TlsRecordProtect.protect
         {state = cProt2, innerType = TlsRecord.Handshake,
          plaintext = cFinMsg2, pad = 0}

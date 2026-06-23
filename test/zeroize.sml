@@ -1,11 +1,23 @@
 (* zeroize.sml
 
-   Track 1b tests: after a full handshake populates traffic keys and other
-   secret material, TlsClient.zeroize / TlsServer.zeroize (and
-   TlsServer.zeroizeConfig for the RSA private key) must overwrite that
-   material with zeros, observable through the test-only `secretsForTest`
-   accessors. Uses SecureZero under the hood (sodium_memzero in the FFI
-   build, a portable Word8Array wipe in the default build). *)
+   Track 1b tests: REAL in-place erasure of TLS secret material.
+
+   Secrets in the handshake state are held in mutable, reference-shared
+   `Secret` buffers (Word8Array-backed). The state machine is purely
+   functional -- `zeroize cst` returns a NEW state -- but because the secret
+   buffers are shared by reference, wiping them through the returned state
+   ALSO erases the bytes seen through the ORIGINAL handle. That is the
+   load-bearing assertion here, and it is impossible with the old immutable
+   `string` secrets (where `zeroize` could only rebind the copy and the
+   original kept its live bytes).
+
+   `secretsForTest` materializes the secrets' CURRENT live bytes each call,
+   so reading it through the original `cst2`/`sst3` after a `zeroize` reflects
+   the in-place wipe. The teardown also wipes the old TlsRecordProtect traffic
+   key/iv buffers and the server PSK ticket store.
+
+   Uses SecureZero under the hood (sodium_memzero in the FFI build, a portable
+   Word8Array wipe in the default build). *)
 
 structure ZeroizeTests =
 struct
@@ -56,6 +68,15 @@ struct
     sigAlg = TlsHandshake.sigRsaPssRsaSha256, now = 0, sigAlgs = []
   } : TlsServer.serverConfig
 
+  val secretClientCfg = {
+    x25519PrivateKey = clientX25519,
+    p256PrivateKey = SOME (String.implode (List.tabulate (32, fn _ => #"\042"))),
+    clientRandom = clientRandom, legacySessionId = "",
+    cipherSuites = [TlsHandshake.suiteTlsAes128GcmSha256],
+    extensions = [], serverName = "example.com",
+    trustStore = [], now = 0, sigAlgs = [TlsHandshake.sigRsaPssRsaSha256]
+  } : TlsClient.clientConfig
+
   (* True iff every byte of every string is 0 (and there is at least one
      non-empty string, so the assertion is meaningful). *)
   fun allZero ss =
@@ -76,6 +97,8 @@ struct
       val () = check "client connected" (TlsClient.isConnected cst2)
       val () = check "server connected" (TlsServer.isConnected sst3)
 
+      (* Snapshot the secret bytes BEFORE any zeroize, read through the
+         original handles. *)
       val cSecrets = TlsClient.secretsForTest cst2
       val sSecrets = TlsServer.secretsForTest sst3
       val () = check "client holds non-empty secrets before zeroize"
@@ -87,21 +110,61 @@ struct
       val () = check "server secrets are NOT all zero before zeroize"
         (not (allZero sSecrets))
 
-      val () = section "zeroize: client/server secrets wiped to zero"
+      val () = section "zeroize: in-place wipe observed through ORIGINAL handle"
+      (* The key new assertion: zeroize the (functionally rebuilt) state,
+         then read the secrets back through the ORIGINAL handle. Because the
+         secret buffers are mutable and reference-shared, the original sees
+         the wipe -- impossible with the old immutable-string secrets. *)
       val cstZ = TlsClient.zeroize cst2
       val sstZ = TlsServer.zeroize sst3
-      val () = check "client secrets all zero after zeroize"
+      val () = check "client secrets all zero through ORIGINAL handle after zeroize"
+        (allZero (TlsClient.secretsForTest cst2))
+      val () = check "server secrets all zero through ORIGINAL handle after zeroize"
+        (allZero (TlsServer.secretsForTest sst3))
+      (* The returned state, sharing the same buffers, is of course also zero. *)
+      val () = check "client secrets all zero through returned handle"
         (allZero (TlsClient.secretsForTest cstZ))
-      val () = check "server secrets all zero after zeroize"
+      val () = check "server secrets all zero through returned handle"
         (allZero (TlsServer.secretsForTest sstZ))
       (* Lengths preserved (we zero in place, not truncate). *)
       val () = checkInt "client secret count unchanged"
-        (List.length cSecrets, List.length (TlsClient.secretsForTest cstZ))
+        (List.length cSecrets, List.length (TlsClient.secretsForTest cst2))
       val () = checkInt "server secret count unchanged"
-        (List.length sSecrets, List.length (TlsServer.secretsForTest sstZ))
+        (List.length sSecrets, List.length (TlsServer.secretsForTest sst3))
       (* The zeroed state stays usable for inspection (no crash). *)
       val () = check "zeroized client still reports connected"
         (TlsClient.isConnected cstZ)
+      val () = check "zeroized server still reports connected"
+        (TlsServer.isConnected sstZ)
+
+      val () = section "zeroize: traffic-key buffers wiped (record protect)"
+      (* The negotiated traffic keys (exposed as (key,iv) through the public
+         accessors) read as zeros through the original handle after zeroize:
+         the old TlsRecordProtect key/iv buffers were wiped in place, not
+         merely replaced-and-dropped. *)
+      val () =
+        case TlsClient.serverHandshakeKey cst2 of
+            SOME (k, iv) =>
+              check "client server-handshake key+iv wiped in place"
+                (allZero [k, iv])
+          | NONE => check "client server-handshake key present" false
+      val () =
+        case TlsServer.serverAppKey sst3 of
+            SOME (k, iv) =>
+              check "server app key+iv wiped in place" (allZero [k, iv])
+          | NONE => check "server app key present" false
+
+      val () = section "zeroize: PSK ticket store wiped on teardown"
+      (* Seed the ticket store with bogus entries, then confirm zeroize wipes
+         the stored PSK bytes. *)
+      val ticketId = "ticket-identity-0001"
+      val ticketPsk = String.implode (List.tabulate (32, fn _ => #"\077"))
+      val () = TlsServer.storeTicketForTest (ticketId, ticketPsk)
+      val () = check "ticket store non-empty before teardown"
+        (anyNonEmpty (TlsServer.ticketStoreSecretsForTest ()))
+      val _ = TlsServer.zeroize sst3
+      val () = check "ticket store PSK bytes all zero after zeroize"
+        (allZero (TlsServer.ticketStoreSecretsForTest ()))
 
       val () = section "zeroize: server RSA private key (config) wiped"
       val () = check "config rsaPrivateKeyDer non-empty before"
@@ -114,6 +177,20 @@ struct
          String.size (#rsaPrivateKeyDer cfgZ))
       val () = check "config x25519PrivateKey wiped too"
         (CharVector.all (fn c => c = #"\000") (#x25519PrivateKey cfgZ))
+
+      val () = section "zeroize: client config wiped (new)"
+      val () = check "client config x25519PrivateKey non-empty before"
+        (String.size (#x25519PrivateKey secretClientCfg) > 0)
+      val ccfgZ = TlsClient.zeroizeConfig secretClientCfg
+      val () = check "client config x25519PrivateKey all zero after"
+        (CharVector.all (fn c => c = #"\000") (#x25519PrivateKey ccfgZ))
+      val () = checkInt "client config x25519PrivateKey length preserved"
+        (String.size (#x25519PrivateKey secretClientCfg),
+         String.size (#x25519PrivateKey ccfgZ))
+      val () = check "client config p256PrivateKey wiped too"
+        (case #p256PrivateKey ccfgZ of
+             SOME s => CharVector.all (fn c => c = #"\000") s
+           | NONE => false)
     in
       ()
     end

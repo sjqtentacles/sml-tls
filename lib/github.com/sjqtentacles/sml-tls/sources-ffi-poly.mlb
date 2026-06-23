@@ -73,6 +73,14 @@ $(SML_LIB)/basis/basis.mlb
 tls.sig
 tls.sml
 
+(* 12b. Track 1b: FFI-backed secure zeroing (sodium_memzero via CryptoFfi) +
+       the mutable, reference-shared `Secret` cell. Loaded BEFORE
+       recordprotect/tlsstate, which hold and wipe `Secret` buffers. *)
+../sml-crypto-ffi/secure_zero.sig
+../sml-crypto-ffi/secure_zero_ffi.sml
+../sml-crypto-ffi/secret.sig
+../sml-crypto-ffi/secret.sml
+
 (* 13. Track modules (A1/A2/A3). *)
 recordprotect.sig
 recordprotect.sml
@@ -80,11 +88,6 @@ certverify.sig
 certverify.sml
 extensions.sig
 extensions.sml
-
-(* 14b. Track 1b: FFI-backed secure zeroing (sodium_memzero via CryptoFfi),
-       replacing the portable pure-SML fallback used by the default build. *)
-../sml-crypto-ffi/secure_zero.sig
-../sml-crypto-ffi/secure_zero_ffi.sml
 
 (* 14. sml-tls state machine (J1 integration): TlsClient / TlsServer / Tls. *)
 tlsstate.sml

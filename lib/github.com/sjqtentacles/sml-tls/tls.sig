@@ -535,6 +535,12 @@ sig
      bytes survives in the heap. Callers should drop the old state. *)
   val zeroize : clientState -> clientState
 
+  (* The client's long-term key material lives in `clientConfig` (the X25519
+     and optional P-256 private keys), not the per-connection state, so it is
+     wiped separately: returns a config with those private-key fields
+     overwritten by zeros. Same immutability caveat as `zeroize`. *)
+  val zeroizeConfig : clientConfig -> clientConfig
+
   (* Test-only accessor: every secret byte string the state holds, so a
      test can assert they are all zero after `zeroize`. *)
   val secretsForTest : clientState -> string list
@@ -641,6 +647,12 @@ sig
      `lookupTicket id` returns the registered resumption PSK for `id`. *)
   val clearTicketStore : unit -> unit
   val lookupTicket : string -> string option
+
+  (* Test-only hooks for the zeroize suite: seed a resumption PSK directly and
+     read the CURRENT live bytes of every stored PSK (so a test can observe
+     them wiped after `zeroize` clears the store in place). *)
+  val storeTicketForTest : string * string -> unit
+  val ticketStoreSecretsForTest : unit -> string list
 end
 
 signature TLS =

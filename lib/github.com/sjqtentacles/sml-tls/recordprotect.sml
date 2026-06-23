@@ -18,24 +18,28 @@
 
 structure TlsRecordProtect :> TLS_RECORD_PROTECT =
 struct
-  (* Opaque per-direction state: the traffic key, the static IV, the
-     AEAD algorithm (inferred from the key length), and the
-     monotonically-increasing 64-bit sequence counter. *)
-  type state = {key : string, iv : string, alg : Aead.alg, seq : int}
+  (* Opaque per-direction state: the traffic key + static IV (mutable,
+     reference-shared `Secret` buffers, so the owner can wipe the live bytes
+     in place at teardown), the AEAD algorithm, and the monotonically-
+     increasing 64-bit sequence counter. *)
+  type state = {key : Secret.secret, iv : Secret.secret, alg : Aead.alg, seq : int}
 
   (* Infer the AEAD algorithm from the traffic-key length. 16 bytes ->
      AES-128-GCM, 32 bytes -> AES-256-GCM. Both share a 12-byte nonce. *)
-  fun algForKey k =
-    if String.size k = 16 then Aead.AesGcm128
-    else if String.size k = 32 then Aead.AesGcm256
+  fun algForKey (k : Secret.secret) =
+    if Secret.length k = 16 then Aead.AesGcm128
+    else if Secret.length k = 32 then Aead.AesGcm256
     else raise Aead.Aead ("TlsRecordProtect: unsupported key length "
-                          ^ Int.toString (String.size k))
+                          ^ Int.toString (Secret.length k))
 
   fun init {key, iv} : state =
     {key = key, iv = iv, alg = algForKey key, seq = 0}
 
   fun initWithAlg {key, iv, alg} : state =
     {key = key, iv = iv, alg = alg, seq = 0}
+
+  fun keySecret (st : state) = #key st
+  fun ivSecret  (st : state) = #iv st
 
   (* The 64-bit sequence number as a big-endian 8-byte string, then
      left-padded with zeros to `Aead.nonceLen` (12) bytes. RFC 8446 §5.3:
@@ -113,6 +117,11 @@ struct
   fun protect {state, innerType, plaintext, pad} : string * state =
     let
       val {key, iv, alg, seq} = state
+      (* Materialize the key/iv bytes only at the AEAD boundary (transient
+         GC'd copies; the secret buffers themselves stay live for later
+         wiping). *)
+      val keyB = Secret.toBytes key
+      val ivB = Secret.toBytes iv
       (* RFC 8446 §5.1: reject plaintext longer than 2^14. We also
          refuse negative pad (a programming error). *)
       val ptLen = String.size plaintext
@@ -125,10 +134,10 @@ struct
       val inner = plaintext
         ^ String.str (Byte.byteToChar (contentTypeToByte innerType))
         ^ String.implode (List.tabulate (pad, fn _ => #"\000"))
-      val n = nonce {iv = iv, seq = seq}
+      val n = nonce {iv = ivB, seq = seq}
       val aad = aadHeader (String.size inner + Aead.tagLen)
       val sealed = Aead.seal alg
-        {key = key, nonce = n, aad = aad, plaintext = inner}
+        {key = keyB, nonce = n, aad = aad, plaintext = inner}
       val st' = {key = key, iv = iv, alg = alg, seq = seq + 1} : state
     in
       (sealed, st')
@@ -138,10 +147,12 @@ struct
       : (TlsRecord.contentType * string * state) option =
     let
       val {key, iv, alg, seq} = state
-      val n = nonce {iv = iv, seq = seq}
+      val keyB = Secret.toBytes key
+      val ivB = Secret.toBytes iv
+      val n = nonce {iv = ivB, seq = seq}
       val aad = aadHeader (String.size record)
     in
-      case Aead.open' alg {key = key, nonce = n, aad = aad, ciphertext = record} of
+      case Aead.open' alg {key = keyB, nonce = n, aad = aad, ciphertext = record} of
           NONE => NONE   (* AEAD failure -> caller maps to bad_record_mac *)
         | SOME inner =>
             let

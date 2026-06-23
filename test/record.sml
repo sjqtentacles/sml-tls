@@ -160,7 +160,7 @@ struct
 
       (* ---- 1. RFC 8448 unprotect: first server handshake record ---- *)
       val () = section "A1: unprotect RFC 8448 server handshake record"
-      val st0 = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val st0 = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       val () = case TlsRecordProtect.unprotect
                      {state = st0, record = encryptedRecordBody} of
                    NONE => checkBool "unprotect returns SOME" (false, true)
@@ -172,7 +172,7 @@ struct
 
       (* ---- 2. Round-trip: protect reproduces the ciphertext ---- *)
       val () = section "A1: protect round-trips to RFC 8448 ciphertext"
-      val st0b = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val st0b = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       val (reencrypted, _) = TlsRecordProtect.protect
         {state = st0b, innerType = TlsRecord.Handshake,
          plaintext = plaintextHandshake, pad = 0}
@@ -195,7 +195,7 @@ struct
 
       (* ---- 4. Padding strip: trailing zeros after the content-type ---- *)
       val () = section "A1: padding strip + inner-type extraction"
-      val stP = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val stP = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       (* Protect a tiny Alert with 3 bytes of content-type-hiding pad. *)
       val alertBody = str2 1 0   (* warning, close_notify *)
       val (padded, stP') = TlsRecordProtect.protect
@@ -215,7 +215,7 @@ struct
       (* ---- 5. record_overflow: plaintext > maxPlaintext rejected ---- *)
       val () = section "A1: record_overflow rejection (5.1)"
       val () = checkInt ("maxPlaintext is 2^14") (16384, TlsRecordProtect.maxPlaintext)
-      val stO = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val stO = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       val tooBig = String.implode
         (List.tabulate (TlsRecordProtect.maxPlaintext + 1, fn _ => #"A"))
       (* RFC 8446 §5.1: a sender MUST NOT emit a record whose plaintext
@@ -241,7 +241,7 @@ struct
 
       (* ---- 6. Tamper: flip one tag byte -> unprotect returns NONE ---- *)
       val () = section "A1: tamper -> NONE (bad_record_mac)"
-      val stT = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val stT = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       val (good, _) = TlsRecordProtect.protect
         {state = stT, innerType = TlsRecord.ApplicationData,
          plaintext = "hello, tls 1.3", pad = 0}
@@ -259,7 +259,7 @@ struct
 
       (* ---- seq advances: two protects at seq 0 then 1 differ ---- *)
       val () = section "A1: seq advances across protects"
-      val stS = TlsRecordProtect.init {key = serverHsKey, iv = serverHsIv}
+      val stS = TlsRecordProtect.init {key = Secret.fromString serverHsKey, iv = Secret.fromString serverHsIv}
       val (r0, stS1) = TlsRecordProtect.protect
         {state = stS, innerType = TlsRecord.ApplicationData,
          plaintext = "first", pad = 0}

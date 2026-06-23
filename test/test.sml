@@ -560,7 +560,7 @@ struct
         (true, appRec0 <> appRec1)
       (* Decrypt them with the server's view of the client app key, in order. *)
       val (cak, caiv) = Option.valOf (TlsClient.clientAppKey cst2)
-      val rd0 = TlsRecordProtect.init {key = cak, iv = caiv}
+      val rd0 = TlsRecordProtect.init {key = Secret.fromString cak, iv = Secret.fromString caiv}
       val () = case TlsRecordProtect.unprotect {state = rd0, record = ctBody appRec0} of
                    SOME (_, pt, rd1) =>
                      (checkBytes ("record 0 (seq 0) decrypts", "message one", pt);
@@ -580,7 +580,7 @@ struct
         (true, TlsServer.clientAppKey sstK = TlsClient.clientAppKey cstK)
       val (_, appRecK) = TlsClient.sendApplicationData (cstK, "after rekey")
       val (nck, nciv) = Option.valOf (TlsClient.clientAppKey cstK)
-      val rdK = TlsRecordProtect.init {key = nck, iv = nciv}
+      val rdK = TlsRecordProtect.init {key = Secret.fromString nck, iv = Secret.fromString nciv}
       val () = case TlsRecordProtect.unprotect {state = rdK, record = ctBody appRecK} of
                    SOME (_, pt, _) => checkBytes ("app data under new key", "after rekey", pt)
                  | NONE => checkBool "app data under new key" (true, false)
@@ -597,7 +597,7 @@ struct
       val nstBody = TlsHandshake.encodeNewSessionTicket nst
       val (_, nstRec) = TlsServer.produceNewSessionTicket (sst3, serverCfg, nstBody)
       val (sak, saiv) = Option.valOf (TlsServer.serverAppKey sst3)
-      val rdN = TlsRecordProtect.init {key = sak, iv = saiv}
+      val rdN = TlsRecordProtect.init {key = Secret.fromString sak, iv = Secret.fromString saiv}
       val () = case TlsRecordProtect.unprotect {state = rdN, record = ctBody nstRec} of
                    SOME (TlsRecord.Handshake, pt, _) =>
                      (case TlsHandshake.decodeMessage pt of

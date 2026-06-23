@@ -34,21 +34,21 @@ struct
      states (which own the AEAD sequence counters). *)
   type clientState = {
     config            : clientConfig,
-    x25519PrivateKey  : string,
+    x25519PrivateKey  : Secret.secret,
     clientHello       : TlsHandshake.clientHello,
     transcript        : string,
     cipherSuite       : Word16.word option,
-    dhe               : string,
+    dhe               : Secret.secret,
     negotiatedGroup   : Word16.word option,
     serverHello       : TlsHandshake.serverHello option,
-    clientHsSecret    : string option,
-    serverHsSecret    : string option,
-    clientApSecret    : string option,
-    serverApSecret    : string option,
-    serverHandshakeKey : (string * string) option,
-    clientHandshakeKey : (string * string) option,
-    serverAppKey : (string * string) option,
-    clientAppKey : (string * string) option,
+    clientHsSecret    : Secret.secret option,
+    serverHsSecret    : Secret.secret option,
+    clientApSecret    : Secret.secret option,
+    serverApSecret    : Secret.secret option,
+    serverHandshakeKey : (Secret.secret * Secret.secret) option,
+    clientHandshakeKey : (Secret.secret * Secret.secret) option,
+    serverAppKey : (Secret.secret * Secret.secret) option,
+    clientAppKey : (Secret.secret * Secret.secret) option,
     serverHsProtect   : TlsRecordProtect.state option,  (* read: server HS *)
     serverApProtect   : TlsRecordProtect.state option,  (* read: server app *)
     clientApProtect   : TlsRecordProtect.state option,  (* write: client app *)
@@ -211,11 +211,11 @@ struct
         {contentType = TlsRecord.Handshake, fragment = msg}
       val st = {
         config = cfg,
-        x25519PrivateKey = #x25519PrivateKey cfg,
+        x25519PrivateKey = Secret.fromString (#x25519PrivateKey cfg),
         clientHello = ch,
         transcript = msg,
         cipherSuite = NONE,
-        dhe = "",
+        dhe = Secret.empty,
         negotiatedGroup = NONE,
         serverHello = NONE,
         clientHsSecret = NONE,
@@ -255,7 +255,7 @@ struct
       (* X25519 public keys are always exactly 32 bytes (RFC 7748); reject
          any other length rather than crashing X25519.dh. *)
       (if String.size peerPub = 32
-       then SOME (X25519.dh (#x25519PrivateKey st) peerPub)
+       then SOME (X25519.dh (Secret.toBytes (#x25519PrivateKey st)) peerPub)
        else NONE)
     else if group = TlsHandshake.groupSecp256r1 then
       (case #p256PrivateKey (#config st) of
@@ -335,25 +335,31 @@ struct
               applicationTranscript = ""
             }
             val (keyLen, ivLen) = suiteKeyIvLen cs
-            val sHsKey = TlsKeySchedule.trafficKey
-              {secret = #serverHandshakeSecret sched, keyLength = keyLen}
-            val sHsIv = TlsKeySchedule.trafficIv
-              {secret = #serverHandshakeSecret sched, ivLength = ivLen}
-            val cHsKey = TlsKeySchedule.trafficKey
-              {secret = #clientHandshakeSecret sched, keyLength = keyLen}
-            val cHsIv = TlsKeySchedule.trafficIv
-              {secret = #clientHandshakeSecret sched, ivLength = ivLen}
+            (* Materialize each derived secret/key/iv into ONE mutable,
+               reference-shared Secret. The same Secret object is stored in
+               the state field AND handed to the record-protection state, so a
+               single in-place wipe at teardown erases both views. *)
+            val cHsSec = Secret.fromString (#clientHandshakeSecret sched)
+            val sHsSec = Secret.fromString (#serverHandshakeSecret sched)
+            val sHsKey = Secret.fromString (TlsKeySchedule.trafficKey
+              {secret = #serverHandshakeSecret sched, keyLength = keyLen})
+            val sHsIv = Secret.fromString (TlsKeySchedule.trafficIv
+              {secret = #serverHandshakeSecret sched, ivLength = ivLen})
+            val cHsKey = Secret.fromString (TlsKeySchedule.trafficKey
+              {secret = #clientHandshakeSecret sched, keyLength = keyLen})
+            val cHsIv = Secret.fromString (TlsKeySchedule.trafficIv
+              {secret = #clientHandshakeSecret sched, ivLength = ivLen})
           in
             { config = #config st,
               x25519PrivateKey = #x25519PrivateKey st,
               clientHello = #clientHello st,
               transcript = transcript,
               cipherSuite = SOME cs,
-              dhe = dhe,
+              dhe = Secret.fromString dhe,
               negotiatedGroup = SOME group,
               serverHello = SOME sh,
-              clientHsSecret = SOME (#clientHandshakeSecret sched),
-              serverHsSecret = SOME (#serverHandshakeSecret sched),
+              clientHsSecret = SOME cHsSec,
+              serverHsSecret = SOME sHsSec,
               clientApSecret = NONE,
               serverApSecret = NONE,
               serverHandshakeKey = SOME (sHsKey, sHsIv),
@@ -442,7 +448,7 @@ struct
               clientHello = ch2,
               transcript = newTranscript,
               cipherSuite = NONE,
-              dhe = "",
+              dhe = Secret.empty,
               negotiatedGroup = SOME group,
               serverHello = NONE,
               clientHsSecret = NONE,
@@ -546,8 +552,8 @@ struct
   fun processFlight (st : clientState, hs : string) : clientState * string list =
     let
       val cs = Option.valOf (#cipherSuite st)
-      val serverHsSecret = Option.valOf (#serverHsSecret st)
-      val clientHsSecret = Option.valOf (#clientHsSecret st)
+      val serverHsSecret = Secret.toBytes (Option.valOf (#serverHsSecret st))
+      val clientHsSecret = Secret.toBytes (Option.valOf (#clientHsSecret st))
       val (keyLen, ivLen) = suiteKeyIvLen cs
       val offeredSigAlgs = #sigAlgs (#config st)
       fun loop (remaining, transcript, certOk, leafCert) =
@@ -644,16 +650,18 @@ struct
                           (* Application-traffic keys from the transcript through
                              the server Finished. *)
                           val sched = TlsKeySchedule.schedule {
-                            dhe = #dhe st,
+                            dhe = Secret.toBytes (#dhe st),
                             handshakeTranscript = #transcript st,
                             applicationTranscript = transcript'
                           }
-                          val sApSec = #serverAppSecret sched
-                          val cApSec = #clientAppSecret sched
-                          val sApKey = TlsKeySchedule.trafficKey {secret = sApSec, keyLength = keyLen}
-                          val sApIv  = TlsKeySchedule.trafficIv  {secret = sApSec, ivLength = ivLen}
-                          val cApKey = TlsKeySchedule.trafficKey {secret = cApSec, keyLength = keyLen}
-                          val cApIv  = TlsKeySchedule.trafficIv  {secret = cApSec, ivLength = ivLen}
+                          val sApSecB = #serverAppSecret sched
+                          val cApSecB = #clientAppSecret sched
+                          val sApSec = Secret.fromString sApSecB
+                          val cApSec = Secret.fromString cApSecB
+                          val sApKey = Secret.fromString (TlsKeySchedule.trafficKey {secret = sApSecB, keyLength = keyLen})
+                          val sApIv  = Secret.fromString (TlsKeySchedule.trafficIv  {secret = sApSecB, ivLength = ivLen})
+                          val cApKey = Secret.fromString (TlsKeySchedule.trafficKey {secret = cApSecB, keyLength = keyLen})
+                          val cApIv  = Secret.fromString (TlsKeySchedule.trafficIv  {secret = cApSecB, ivLength = ivLen})
                           (* Client Finished MAC over the transcript through the
                              server Finished. *)
                           val cfKey = TlsKeySchedule.finishedKey {secret = clientHsSecret}
@@ -720,16 +728,17 @@ struct
     let
       val cs = Option.valOf (#cipherSuite st)
       val (kl, il) = suiteKeyIvLen cs
-      val next = nextAppSecret (Option.valOf (#serverApSecret st))
-      val k = TlsKeySchedule.trafficKey {secret = next, keyLength = kl}
-      val iv = TlsKeySchedule.trafficIv {secret = next, ivLength = il}
+      val next = nextAppSecret (Secret.toBytes (Option.valOf (#serverApSecret st)))
+      val nextS = Secret.fromString next
+      val k = Secret.fromString (TlsKeySchedule.trafficKey {secret = next, keyLength = kl})
+      val iv = Secret.fromString (TlsKeySchedule.trafficIv {secret = next, ivLength = il})
     in
       { config = #config st, x25519PrivateKey = #x25519PrivateKey st,
         clientHello = #clientHello st, transcript = #transcript st,
         cipherSuite = #cipherSuite st, dhe = #dhe st,
         negotiatedGroup = #negotiatedGroup st, serverHello = #serverHello st,
         clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
-        clientApSecret = #clientApSecret st, serverApSecret = SOME next,
+        clientApSecret = #clientApSecret st, serverApSecret = SOME nextS,
         serverHandshakeKey = #serverHandshakeKey st,
         clientHandshakeKey = #clientHandshakeKey st,
         serverAppKey = SOME (k, iv), clientAppKey = #clientAppKey st,
@@ -871,16 +880,17 @@ struct
             val record = TlsRecord.encodeCiphertext
               {contentType = TlsRecord.ApplicationData, encryptedRecord = body}
             val (kl, il) = suiteKeyIvLen cs
-            val next = nextAppSecret secret
-            val k = TlsKeySchedule.trafficKey {secret = next, keyLength = kl}
-            val iv = TlsKeySchedule.trafficIv {secret = next, ivLength = il}
+            val next = nextAppSecret (Secret.toBytes secret)
+            val nextS = Secret.fromString next
+            val k = Secret.fromString (TlsKeySchedule.trafficKey {secret = next, keyLength = kl})
+            val iv = Secret.fromString (TlsKeySchedule.trafficIv {secret = next, ivLength = il})
             val st' = {
               config = #config st, x25519PrivateKey = #x25519PrivateKey st,
               clientHello = #clientHello st, transcript = #transcript st,
               cipherSuite = #cipherSuite st, dhe = #dhe st,
               negotiatedGroup = #negotiatedGroup st, serverHello = #serverHello st,
               clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
-              clientApSecret = SOME next, serverApSecret = #serverApSecret st,
+              clientApSecret = SOME nextS, serverApSecret = #serverApSecret st,
               serverHandshakeKey = #serverHandshakeKey st,
               clientHandshakeKey = #clientHandshakeKey st,
               serverAppKey = #serverAppKey st, clientAppKey = SOME (k, iv),
@@ -897,67 +907,84 @@ struct
   fun error (st : clientState) : Word8.word option = #errorAlert st
 
   fun negotiatedCipherSuite (st : clientState) = #cipherSuite st
-  fun serverHandshakeKey (st : clientState) = #serverHandshakeKey st
-  fun clientHandshakeKey (st : clientState) = #clientHandshakeKey st
-  fun serverAppKey (st : clientState) = #serverAppKey st
-  fun clientAppKey (st : clientState) = #clientAppKey st
+  local
+    fun kivBytes NONE = NONE
+      | kivBytes (SOME (k, iv)) = SOME (Secret.toBytes k, Secret.toBytes iv)
+  in
+    fun serverHandshakeKey (st : clientState) = kivBytes (#serverHandshakeKey st)
+    fun clientHandshakeKey (st : clientState) = kivBytes (#clientHandshakeKey st)
+    fun serverAppKey (st : clientState) = kivBytes (#serverAppKey st)
+    fun clientAppKey (st : clientState) = kivBytes (#clientAppKey st)
+  end
   fun transcript (st : clientState) = #transcript st
   fun isConnected (st : clientState) = #connected st
 
   fun certVerified (st : clientState) = #certVerified st
 
   (* ---- Track 1b: secure zeroing of client key material ---- *)
+  (* Wipe every secret buffer the state holds IN PLACE (mutating the live,
+     reference-shared Word8Array), then return the SAME state. Because the
+     buffers are shared, the wipe is observable through every alias of the
+     state -- including the original handle the caller passed in -- not just
+     the returned value. This is the real in-place erasure the old
+     rebind-to-zeros could not provide. *)
   local
-    fun zStr s = SecureZero.zeroString s
-    fun zOpt NONE = NONE
-      | zOpt (SOME s) = SOME (SecureZero.zeroString s)
-    fun zKey NONE = NONE
-      | zKey (SOME (k, iv)) =
-          SOME (SecureZero.zeroString k, SecureZero.zeroString iv)
-    (* Re-init a record-protection state from a zeroed (key,iv), so the
-       AEAD state no longer references live key bytes. *)
-    fun zProt NONE = NONE
-      | zProt (SOME _) =
-          let val z = SecureZero.zeroString (String.implode (List.tabulate (16, fn _ => #"\000")))
-          in SOME (TlsRecordProtect.init {key = z, iv =
-               SecureZero.zeroString (String.implode (List.tabulate (12, fn _ => #"\000")))}) end
+    fun wOpt NONE = () | wOpt (SOME s) = Secret.wipe s
+    fun wKey NONE = () | wKey (SOME (k, iv)) = (Secret.wipe k; Secret.wipe iv)
+    (* Wipe the old record-protect state's key/iv buffers in place before we
+       drop the reference (the `zProt` gap: the old key bytes used to leak). *)
+    fun wProt NONE = () | wProt (SOME st) =
+      (Secret.wipe (TlsRecordProtect.keySecret st);
+       Secret.wipe (TlsRecordProtect.ivSecret st))
   in
     fun zeroize (st : clientState) : clientState =
-      { config = #config st,
-        x25519PrivateKey = zStr (#x25519PrivateKey st),
-        clientHello = #clientHello st,
-        transcript = #transcript st,
-        cipherSuite = #cipherSuite st,
-        dhe = zStr (#dhe st),
-        negotiatedGroup = #negotiatedGroup st,
-        serverHello = #serverHello st,
-        clientHsSecret = zOpt (#clientHsSecret st),
-        serverHsSecret = zOpt (#serverHsSecret st),
-        clientApSecret = zOpt (#clientApSecret st),
-        serverApSecret = zOpt (#serverApSecret st),
-        serverHandshakeKey = zKey (#serverHandshakeKey st),
-        clientHandshakeKey = zKey (#clientHandshakeKey st),
-        serverAppKey = zKey (#serverAppKey st),
-        clientAppKey = zKey (#clientAppKey st),
-        serverHsProtect = zProt (#serverHsProtect st),
-        serverApProtect = zProt (#serverApProtect st),
-        clientApProtect = zProt (#clientApProtect st),
-        certVerified = #certVerified st,
-        errorAlert = #errorAlert st,
-        connected = #connected st }
+      ( Secret.wipe (#x25519PrivateKey st)
+      ; Secret.wipe (#dhe st)
+      ; wOpt (#clientHsSecret st)
+      ; wOpt (#serverHsSecret st)
+      ; wOpt (#clientApSecret st)
+      ; wOpt (#serverApSecret st)
+      ; wKey (#serverHandshakeKey st)
+      ; wKey (#clientHandshakeKey st)
+      ; wKey (#serverAppKey st)
+      ; wKey (#clientAppKey st)
+      ; wProt (#serverHsProtect st)
+      ; wProt (#serverApProtect st)
+      ; wProt (#clientApProtect st)
+      ; st )
   end
 
   fun secretsForTest (st : clientState) : string list =
     let
-      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [k, iv]
-      fun ofOpt NONE = [] | ofOpt (SOME s) = [s]
+      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [Secret.toBytes k, Secret.toBytes iv]
+      fun ofOpt NONE = [] | ofOpt (SOME s) = [Secret.toBytes s]
     in
-      [#x25519PrivateKey st, #dhe st]
+      [Secret.toBytes (#x25519PrivateKey st), Secret.toBytes (#dhe st)]
       @ ofOpt (#clientHsSecret st) @ ofOpt (#serverHsSecret st)
       @ ofOpt (#clientApSecret st) @ ofOpt (#serverApSecret st)
       @ ofKey (#serverHandshakeKey st) @ ofKey (#clientHandshakeKey st)
       @ ofKey (#serverAppKey st) @ ofKey (#clientAppKey st)
     end
+
+  (* The client's long-term key material lives in `clientConfig` (the X25519
+     and optional P-256 private keys), not the per-connection state, so it is
+     wiped separately. Config fields are caller-provided immutable strings, so
+     this returns a config with those fields rebound to zeros (best-effort,
+     same immutability caveat as the server `zeroizeConfig`). *)
+  fun zeroizeConfig (cfg : clientConfig) : clientConfig =
+    { x25519PrivateKey = SecureZero.zeroString (#x25519PrivateKey cfg),
+      p256PrivateKey =
+        (case #p256PrivateKey cfg of
+             NONE => NONE
+           | SOME s => SOME (SecureZero.zeroString s)),
+      clientRandom = #clientRandom cfg,
+      legacySessionId = #legacySessionId cfg,
+      cipherSuites = #cipherSuites cfg,
+      extensions = #extensions cfg,
+      serverName = #serverName cfg,
+      trustStore = #trustStore cfg,
+      now = #now cfg,
+      sigAlgs = #sigAlgs cfg }
 end
 
 structure TlsServer :> TLS_SERVER =
@@ -981,23 +1008,23 @@ struct
   }
 
   type serverState = {
-    x25519PrivateKey  : string,
+    x25519PrivateKey  : Secret.secret,
     serverRandom      : string,
     cipherSuite       : Word16.word option,
     legacySessionId   : string,
     extensions        : TlsHandshake.extension list,
     transcript        : string,
-    dhe               : string,
+    dhe               : Secret.secret,
     clientHello       : TlsHandshake.clientHello option,
     serverHello       : TlsHandshake.serverHello option,
-    clientHsSecret    : string option,
-    serverHsSecret    : string option,
-    clientApSecret    : string option,
-    serverApSecret    : string option,
-    serverHandshakeKey : (string * string) option,
-    clientHandshakeKey : (string * string) option,
-    serverAppKey : (string * string) option,
-    clientAppKey : (string * string) option,
+    clientHsSecret    : Secret.secret option,
+    serverHsSecret    : Secret.secret option,
+    clientApSecret    : Secret.secret option,
+    serverApSecret    : Secret.secret option,
+    serverHandshakeKey : (Secret.secret * Secret.secret) option,
+    clientHandshakeKey : (Secret.secret * Secret.secret) option,
+    serverAppKey : (Secret.secret * Secret.secret) option,
+    clientAppKey : (Secret.secret * Secret.secret) option,
     clientHsProtect   : TlsRecordProtect.state option,  (* read: client HS *)
     clientApProtect   : TlsRecordProtect.state option,  (* read: client app *)
     serverApProtect   : TlsRecordProtect.state option,  (* write: server app *)
@@ -1023,15 +1050,22 @@ struct
      resumption PSK derived from the issuing connection. Populated by
      produceNewSessionTicket and consulted by produceServerHello. A
      process-wide ref models a single server's session cache. *)
-  val ticketStore : (string * string) list ref = ref []
+  val ticketStore : (string * Secret.secret) list ref = ref []
 
-  fun clearTicketStore () = ticketStore := []
+  (* Wipe every stored PSK buffer in place, then drop the entries. The PSKs
+     are reference-shared Secret buffers, so this erases the live bytes before
+     the list is cleared (teardown of the server session cache). *)
+  fun clearTicketStore () =
+    ( List.app (fn (_, psk) => Secret.wipe psk) (!ticketStore)
+    ; ticketStore := [] )
 
   fun lookupTicket id =
-    Option.map #2 (List.find (fn (k, _) => k = id) (!ticketStore))
+    Option.map (Secret.toBytes o #2)
+               (List.find (fn (k, _) => k = id) (!ticketStore))
 
   fun storeTicket (id, psk) =
-    ticketStore := (id, psk) :: List.filter (fn (k, _) => k <> id) (!ticketStore)
+    ticketStore := (id, Secret.fromString psk)
+                   :: List.filter (fn (k, _) => k <> id) (!ticketStore)
 
   (* RFC 8446 §5.2 record_overflow bound (see TlsClient). *)
   val maxCiphertextLen = 16384 + 256
@@ -1071,13 +1105,13 @@ struct
             val chMsg = TlsHandshake.encodeMessage
               {msgType = TlsHandshake.ClientHello, body = chBody}
           in
-            { x25519PrivateKey = "",
+            { x25519PrivateKey = Secret.empty,
               serverRandom = "",
               cipherSuite = NONE,
               legacySessionId = "",
               extensions = [],
               transcript = chMsg,
-              dhe = "",
+              dhe = Secret.empty,
               clientHello = SOME ch,
               serverHello = NONE,
               clientHsSecret = NONE,
@@ -1358,28 +1392,30 @@ struct
            cs = TlsHandshake.suiteTlsChaCha20Poly1305 then (16, 12)
         else if cs = TlsHandshake.suiteTlsAes256GcmSha384 then (32, 12)
         else (16, 12)
-      val sHsKey = TlsKeySchedule.trafficKey
-        {secret = #serverHandshakeSecret sched, keyLength = keyLen}
-      val sHsIv = TlsKeySchedule.trafficIv
-        {secret = #serverHandshakeSecret sched, ivLength = ivLen}
-      val cHsKey = TlsKeySchedule.trafficKey
-        {secret = #clientHandshakeSecret sched, keyLength = keyLen}
-      val cHsIv = TlsKeySchedule.trafficIv
-        {secret = #clientHandshakeSecret sched, ivLength = ivLen}
+      val cHsSec = Secret.fromString (#clientHandshakeSecret sched)
+      val sHsSec = Secret.fromString (#serverHandshakeSecret sched)
+      val sHsKey = Secret.fromString (TlsKeySchedule.trafficKey
+        {secret = #serverHandshakeSecret sched, keyLength = keyLen})
+      val sHsIv = Secret.fromString (TlsKeySchedule.trafficIv
+        {secret = #serverHandshakeSecret sched, ivLength = ivLen})
+      val cHsKey = Secret.fromString (TlsKeySchedule.trafficKey
+        {secret = #clientHandshakeSecret sched, keyLength = keyLen})
+      val cHsIv = Secret.fromString (TlsKeySchedule.trafficIv
+        {secret = #clientHandshakeSecret sched, ivLength = ivLen})
       val record = TlsRecord.encodePlaintext
         {contentType = TlsRecord.Handshake, fragment = shMsg}
       val st' = {
-        x25519PrivateKey = #x25519PrivateKey cfg,
+        x25519PrivateKey = Secret.fromString (#x25519PrivateKey cfg),
         serverRandom = #serverRandom cfg,
         cipherSuite = SOME cs,
         legacySessionId = #legacySessionId cfg,
         extensions = #extensions cfg,
         transcript = transcript,
-        dhe = dhe,
+        dhe = Secret.fromString dhe,
         clientHello = #clientHello st,
         serverHello = SOME sh,
-        clientHsSecret = SOME (#clientHandshakeSecret sched),
-        serverHsSecret = SOME (#serverHandshakeSecret sched),
+        clientHsSecret = SOME cHsSec,
+        serverHsSecret = SOME sHsSec,
         clientApSecret = NONE,
         serverApSecret = NONE,
         serverHandshakeKey = SOME (sHsKey, sHsIv),
@@ -1407,7 +1443,7 @@ struct
     let
       val cs = Option.valOf (#cipherSuite st)
       val (keyLen, ivLen) = suiteKeyIvLen cs
-      val serverHsSecret = Option.valOf (#serverHsSecret st)
+      val serverHsSecret = Secret.toBytes (Option.valOf (#serverHsSecret st))
       val sHsKiv = Option.valOf (#serverHandshakeKey st)
       (* PSK resumption: a handshake authenticated by the PSK omits the
          server Certificate / CertificateVerify (RFC 8446 §2.2, §4.4.2) and
@@ -1476,19 +1512,21 @@ struct
       val sched =
         case resumePsk of
             SOME psk => TlsKeySchedule.schedulePsk {
-              psk = psk, dhe = #dhe st,
+              psk = psk, dhe = Secret.toBytes (#dhe st),
               handshakeTranscript = #transcript st,
               applicationTranscript = transcript'}
           | NONE => TlsKeySchedule.schedule {
-              dhe = #dhe st,
+              dhe = Secret.toBytes (#dhe st),
               handshakeTranscript = #transcript st,
               applicationTranscript = transcript'}
-      val sApSec = #serverAppSecret sched
-      val cApSec = #clientAppSecret sched
-      val sApKey = TlsKeySchedule.trafficKey {secret = sApSec, keyLength = keyLen}
-      val sApIv  = TlsKeySchedule.trafficIv  {secret = sApSec, ivLength = ivLen}
-      val cApKey = TlsKeySchedule.trafficKey {secret = cApSec, keyLength = keyLen}
-      val cApIv  = TlsKeySchedule.trafficIv  {secret = cApSec, ivLength = ivLen}
+      val sApSecB = #serverAppSecret sched
+      val cApSecB = #clientAppSecret sched
+      val sApSec = Secret.fromString sApSecB
+      val cApSec = Secret.fromString cApSecB
+      val sApKey = Secret.fromString (TlsKeySchedule.trafficKey {secret = sApSecB, keyLength = keyLen})
+      val sApIv  = Secret.fromString (TlsKeySchedule.trafficIv  {secret = sApSecB, ivLength = ivLen})
+      val cApKey = Secret.fromString (TlsKeySchedule.trafficKey {secret = cApSecB, keyLength = keyLen})
+      val cApIv  = Secret.fromString (TlsKeySchedule.trafficIv  {secret = cApSecB, ivLength = ivLen})
       (* Protect each handshake message as its own record under the server HS
          key, threading the write seq. *)
       fun emit (prot, msg) =
@@ -1568,7 +1606,7 @@ struct
                     else
                       let
                         val ms = #masterSecret (TlsKeySchedule.schedule
-                          {dhe = #dhe st, handshakeTranscript = "",
+                          {dhe = Secret.toBytes (#dhe st), handshakeTranscript = "",
                            applicationTranscript = ""})
                         val rms = TlsKeySchedule.resumptionMasterSecret
                           {masterSecret = ms, transcript = #transcript st}
@@ -1627,16 +1665,17 @@ struct
     let
       val cs = Option.valOf (#cipherSuite st)
       val (kl, il) = suiteKeyIvLen cs
-      val next = nextAppSecret (Option.valOf (#clientApSecret st))
-      val k = TlsKeySchedule.trafficKey {secret = next, keyLength = kl}
-      val iv = TlsKeySchedule.trafficIv {secret = next, ivLength = il}
+      val next = nextAppSecret (Secret.toBytes (Option.valOf (#clientApSecret st)))
+      val nextS = Secret.fromString next
+      val k = Secret.fromString (TlsKeySchedule.trafficKey {secret = next, keyLength = kl})
+      val iv = Secret.fromString (TlsKeySchedule.trafficIv {secret = next, ivLength = il})
     in
       { x25519PrivateKey = #x25519PrivateKey st, serverRandom = #serverRandom st,
         cipherSuite = #cipherSuite st, legacySessionId = #legacySessionId st,
         extensions = #extensions st, transcript = #transcript st, dhe = #dhe st,
         clientHello = #clientHello st, serverHello = #serverHello st,
         clientHsSecret = #clientHsSecret st, serverHsSecret = #serverHsSecret st,
-        clientApSecret = SOME next, serverApSecret = #serverApSecret st,
+        clientApSecret = SOME nextS, serverApSecret = #serverApSecret st,
         serverHandshakeKey = #serverHandshakeKey st,
         clientHandshakeKey = #clientHandshakeKey st,
         serverAppKey = #serverAppKey st, clientAppKey = SOME (k, iv),
@@ -1725,7 +1764,7 @@ struct
                                 | SOME ({msgType = TlsHandshake.Finished, body}, _) =>
                                     let
                                       val cfKey = TlsKeySchedule.finishedKey
-                                        {secret = Option.valOf (#clientHsSecret st)}
+                                        {secret = Secret.toBytes (Option.valOf (#clientHsSecret st))}
                                       val expected = TlsKeySchedule.finishedVerifyData
                                         {finishedKey = cfKey, transcript = #transcript st}
                                     in
@@ -1769,50 +1808,47 @@ struct
   fun error (st : serverState) : Word8.word option = #errorAlert st
 
   fun negotiatedCipherSuite (st : serverState) = #cipherSuite st
-  fun serverHandshakeKey (st : serverState) = #serverHandshakeKey st
-  fun clientHandshakeKey (st : serverState) = #clientHandshakeKey st
-  fun serverAppKey (st : serverState) = #serverAppKey st
-  fun clientAppKey (st : serverState) = #clientAppKey st
+  local
+    fun kivBytes NONE = NONE
+      | kivBytes (SOME (k, iv)) = SOME (Secret.toBytes k, Secret.toBytes iv)
+  in
+    fun serverHandshakeKey (st : serverState) = kivBytes (#serverHandshakeKey st)
+    fun clientHandshakeKey (st : serverState) = kivBytes (#clientHandshakeKey st)
+    fun serverAppKey (st : serverState) = kivBytes (#serverAppKey st)
+    fun clientAppKey (st : serverState) = kivBytes (#clientAppKey st)
+  end
   fun transcript (st : serverState) = #transcript st
   fun isConnected (st : serverState) = #connected st
 
   (* ---- Track 1b: secure zeroing of server key material ---- *)
+  (* In-place wipe of every reference-shared secret buffer the state holds,
+     plus the old TlsRecordProtect key/iv buffers and the PSK ticket store,
+     then return the SAME state. Observable through every alias (see the
+     client `zeroize` for the rationale). *)
   local
-    fun zStr s = SecureZero.zeroString s
-    fun zOpt NONE = NONE
-      | zOpt (SOME s) = SOME (SecureZero.zeroString s)
-    fun zKey NONE = NONE
-      | zKey (SOME (k, iv)) =
-          SOME (SecureZero.zeroString k, SecureZero.zeroString iv)
-    fun zProt NONE = NONE
-      | zProt (SOME _) =
-          SOME (TlsRecordProtect.init
-            {key = SecureZero.zeroString (String.implode (List.tabulate (16, fn _ => #"\000"))),
-             iv = SecureZero.zeroString (String.implode (List.tabulate (12, fn _ => #"\000")))})
+    fun wOpt NONE = () | wOpt (SOME s) = Secret.wipe s
+    fun wKey NONE = () | wKey (SOME (k, iv)) = (Secret.wipe k; Secret.wipe iv)
+    fun wProt NONE = () | wProt (SOME st) =
+      (Secret.wipe (TlsRecordProtect.keySecret st);
+       Secret.wipe (TlsRecordProtect.ivSecret st))
   in
     fun zeroize (st : serverState) : serverState =
-      { x25519PrivateKey = zStr (#x25519PrivateKey st),
-        serverRandom = #serverRandom st,
-        cipherSuite = #cipherSuite st,
-        legacySessionId = #legacySessionId st,
-        extensions = #extensions st,
-        transcript = #transcript st,
-        dhe = zStr (#dhe st),
-        clientHello = #clientHello st,
-        serverHello = #serverHello st,
-        clientHsSecret = zOpt (#clientHsSecret st),
-        serverHsSecret = zOpt (#serverHsSecret st),
-        clientApSecret = zOpt (#clientApSecret st),
-        serverApSecret = zOpt (#serverApSecret st),
-        serverHandshakeKey = zKey (#serverHandshakeKey st),
-        clientHandshakeKey = zKey (#clientHandshakeKey st),
-        serverAppKey = zKey (#serverAppKey st),
-        clientAppKey = zKey (#clientAppKey st),
-        clientHsProtect = zProt (#clientHsProtect st),
-        clientApProtect = zProt (#clientApProtect st),
-        serverApProtect = zProt (#serverApProtect st),
-        errorAlert = #errorAlert st,
-        connected = #connected st }
+      ( Secret.wipe (#x25519PrivateKey st)
+      ; Secret.wipe (#dhe st)
+      ; wOpt (#clientHsSecret st)
+      ; wOpt (#serverHsSecret st)
+      ; wOpt (#clientApSecret st)
+      ; wOpt (#serverApSecret st)
+      ; wKey (#serverHandshakeKey st)
+      ; wKey (#clientHandshakeKey st)
+      ; wKey (#serverAppKey st)
+      ; wKey (#clientAppKey st)
+      ; wProt (#clientHsProtect st)
+      ; wProt (#clientApProtect st)
+      ; wProt (#serverApProtect st)
+      (* Wipe the process-wide PSK resumption store on teardown. *)
+      ; clearTicketStore ()
+      ; st )
   end
 
   fun zeroizeConfig (cfg : serverConfig) : serverConfig =
@@ -1833,15 +1869,21 @@ struct
 
   fun secretsForTest (st : serverState) : string list =
     let
-      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [k, iv]
-      fun ofOpt NONE = [] | ofOpt (SOME s) = [s]
+      fun ofKey NONE = [] | ofKey (SOME (k, iv)) = [Secret.toBytes k, Secret.toBytes iv]
+      fun ofOpt NONE = [] | ofOpt (SOME s) = [Secret.toBytes s]
     in
-      [#x25519PrivateKey st, #dhe st]
+      [Secret.toBytes (#x25519PrivateKey st), Secret.toBytes (#dhe st)]
       @ ofOpt (#clientHsSecret st) @ ofOpt (#serverHsSecret st)
       @ ofOpt (#clientApSecret st) @ ofOpt (#serverApSecret st)
       @ ofKey (#serverHandshakeKey st) @ ofKey (#clientHandshakeKey st)
       @ ofKey (#serverAppKey st) @ ofKey (#clientAppKey st)
     end
+
+  (* Test-only hooks into the PSK ticket store, so the zeroize suite can seed
+     a resumption PSK and observe it wiped at teardown. *)
+  fun storeTicketForTest (id, psk) = storeTicket (id, psk)
+  fun ticketStoreSecretsForTest () =
+    List.map (fn (_, psk) => Secret.toBytes psk) (!ticketStore)
 end
 
 structure Tls :> TLS =

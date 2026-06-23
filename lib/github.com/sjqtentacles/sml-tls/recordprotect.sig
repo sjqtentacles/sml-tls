@@ -16,18 +16,29 @@
 signature TLS_RECORD_PROTECT =
 sig
   (* Opaque per-direction state: holds the traffic key, the static IV,
-     and the monotonically-increasing 64-bit sequence counter. *)
+     and the monotonically-increasing 64-bit sequence counter. The key and
+     IV are held in mutable, reference-shared `Secret` buffers so the state
+     machine can wipe the live bytes in place at teardown (see `keySecret` /
+     `ivSecret`). *)
   type state
 
-  (* Initialise a fresh read/write direction from traffic key + IV. *)
-  val init : {key : string, iv : string} -> state
+  (* Initialise a fresh read/write direction from traffic key + IV secrets.
+     The state takes (shared) references to the given secrets; wiping them
+     later -- e.g. via `keySecret`/`ivSecret` at zeroize time -- erases the
+     bytes this state uses for AEAD. *)
+  val init : {key : Secret.secret, iv : Secret.secret} -> state
 
   (* Initialise with an explicit AEAD algorithm. The J1 integrator uses
      this to thread the negotiated cipher suite through to record
      protection, so that AES-256-GCM (0x1302) is distinguished from
      ChaCha20-Poly1305 (0x1303) -- both have 32-byte keys, so the
      key-length inference in `init` cannot tell them apart. *)
-  val initWithAlg : {key : string, iv : string, alg : Aead.alg} -> state
+  val initWithAlg : {key : Secret.secret, iv : Secret.secret, alg : Aead.alg} -> state
+
+  (* The live key / IV secret buffers held by this state, so the owner can
+     wipe them in place when tearing the connection down. *)
+  val keySecret : state -> Secret.secret
+  val ivSecret  : state -> Secret.secret
 
   (* Per-record nonce = static IV XOR big-endian seq, left-padded to
      `Aead.nonceLen` (RFC 8446 §5.3). *)

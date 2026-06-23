@@ -81,6 +81,16 @@ $(SML_LIB)/basis/basis.mlb
 tls.sig
 tls.sml
 
+(* 12b. Track 1b: secure zeroing primitive + the mutable, reference-shared
+       `Secret` cell. Loaded BEFORE recordprotect/tlsstate, which hold and
+       wipe `Secret` buffers. The default build uses the portable pure-SML
+       fallback (secure_zero_pure.sml); the FFI build swaps in
+       secure_zero_ffi.sml (sodium_memzero). *)
+../sml-crypto-ffi/secure_zero.sig
+../sml-crypto-ffi/secure_zero_pure.sml
+../sml-crypto-ffi/secret.sig
+../sml-crypto-ffi/secret.sml
+
 (* 13. Track modules (A1/A2/A3). These reference TlsRecord / TlsAlert /
        TlsHandshake / TlsKeySchedule defined in tls.sml, so they come after
        tls.sml -- but BEFORE tlsstate.sml, which calls into them at J1. *)
@@ -90,14 +100,6 @@ certverify.sig
 certverify.sml
 extensions.sig
 extensions.sml
-
-(* 14b. Track 1b: best-effort secure zeroing of key material. The default
-       build uses the portable pure-SML fallback (secure_zero_pure.sml);
-       the FFI build swaps in secure_zero_ffi.sml (sodium_memzero). Loaded
-       before tlsstate.sml, which calls SecureZero in TlsClient/TlsServer
-       .zeroize. *)
-../sml-crypto-ffi/secure_zero.sig
-../sml-crypto-ffi/secure_zero_pure.sml
 
 (* 14. sml-tls state machine (J1 integration): TlsClient / TlsServer / Tls.
        Loads last so it can call TlsRecordProtect (A1), TlsCertVerify (A2),

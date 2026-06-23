@@ -195,16 +195,20 @@ struct
         end )
   end
 
-  (* Word8Array path: copy into an int array, zero via the shim, then copy
-     the zeros back so the caller's array is wiped too. (sodium_memzero on
-     the temporary guarantees the value-zeroing is not elided.) *)
+  (* Word8Array path: marshal the CALLER's array into an int array, route
+     THAT array through sml_memzero (sodium_memzero, which the optimizer may
+     not elide), then copy the zeros the shim produced back into the caller's
+     Word8Array. The previous version zeroed a throwaway array and then did a
+     pure `Word8Array.modify`, so the caller's bytes never actually crossed
+     the FFI to sodium_memzero -- that bug is fixed here. *)
   fun memzero a =
     let
       val () = init ()
       val n = Word8Array.length a
-      val tmp = Array.array (n, 0)
+      val tmp = Array.tabulate (n, fn i => Word8.toInt (Word8Array.sub (a, i)))
       val () = cMemzeroI (tmp, n)
     in
-      Word8Array.modify (fn _ => 0w0) a
+      Word8Array.modifyi
+        (fn (i, _) => Word8.fromInt (Array.sub (tmp, i))) a
     end
 end
