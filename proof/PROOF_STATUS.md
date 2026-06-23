@@ -8,13 +8,14 @@ spec, the SML implementation (`lib/.../sml-tls/tls.sml`), and the CakeML port
 ## Build
 
 `Holmake` builds `proof/` **clean** (verified from a `Holmake cleanAll` then
-`Holmake`): all three theories compile and every `Theorem … QED` is closed by
-a real proof. There are **no `cheat`s**, **no `new_axiom`s**, and **no custom
-oracles**. A machine check of the built theories reports:
+`Holmake`): all **five** theories compile and every `Theorem … QED` is closed
+by a real proof. There are **no `cheat`s**, **no `new_axiom`s**, and **no
+custom oracles**. A machine check of the built theories reports:
 
-* `axioms("tls_wire")` = `axioms("tls_keyschedule")` = `axioms("tls_handshake")` = `axioms("tls_sha256")` = `0`
+* `axioms("tls_wire")` = `axioms("tls_keyschedule")` = `axioms("tls_handshake")` = `axioms("tls_sha256")` = `axioms("tls_refinement")` = `0`
 * the only oracle tag on any theorem is `DISK_THM` (the benign tag HOL4 puts
   on every theorem serialized to/from disk — it is **not** a trust oracle).
+  All 33 theorems in `tls_refinementTheory` carry only `DISK_THM`.
 
 So every theorem listed as "proved" below is proved in the HOL4 kernel,
 subject only to the explicitly-labeled assumptions in the section "Trusted
@@ -212,8 +213,122 @@ Reachability + inductive safety invariants:
 
 ---
 
-## Trusted boundary (summary)
+---
 
+## `tls_refinementTheory` — CakeML ↔ HOL spec refinement (Track 2c)
+
+This theory mechanizes the link between the CakeML implementation
+(`cakeml/tls.sml`, `cakeml/tls_state.sml`) and the HOL4 wire/handshake specs.
+It builds clean with **`axioms("tls_refinement") = 0`**, no `cheat`, and only
+the benign `DISK_THM` tag.
+
+### Method and its honest limitation (hand-mirror, not yet `ml_translatorLib`)
+
+The CakeML port and the HOL4 spec model the **same** RFC 8446 codecs in two
+surface representations: the spec uses records over `word8 list` / `word16`
+with HOL word arithmetic, while CakeML (no records, no `Word16/Word32`) uses
+tuples, native-`int` bytes (de)serialized by `div`/`mod` and `*256+`, and
+`string`s of 0..255 chars. This theory **mirrors the CakeML codec functions by
+hand in HOL4** — same tuple shapes, same `div`/`mod` arithmetic, same length
+guards — over a faithful representation of the CakeML value space
+(a CakeML byte `int` = a HOL `num`; a CakeML `string` = a HOL `num list`;
+`String.size`=`LENGTH`, `String.sub`=`EL`, `String.substring`=`TAKE∘DROP`,
+`String.extract _ None`=`DROP`, `^`=`++`, `Char.ord/Char.chr`=identity on
+0..255), and proves these mirrors **equal** the spec codecs transported across
+the byte-representation map `b2n = w2n` / `s2ns = MAP w2n`.
+
+**Translator-certification gap (remaining 2c work).** These equalities are
+proved against a hand-written HOL mirror of `cakeml/tls.sml`, **not** against
+an `ml_translatorLib`-certified deep embedding of the actual CakeML AST.
+Integrating the full CakeML translator build (which deep-embeds the source and
+emits a certificate relating the HOL function to the CakeML semantics) is heavy
+(it previously caused resource exhaustion and was deliberately not rebuilt this
+session). The link "the HOL mirror is *the* function `ml_translatorLib`
+extracts from `cakeml/tls.sml`" is the **only** unfilled step of 2c. The
+mathematically substantive half — that the CakeML-shaped arithmetic/control-flow
+codec computes exactly the spec codec — **is** proved.
+
+### Codec refinement theorems — all **proved** (hand-mirrored)
+
+Representation map: `b2n_def` (`w2n`), `s2ns_def` (`MAP w2n`). Arithmetic-core
+lemmas (**proved**): `w16_split_refines` (the CakeML `n div 256` / `n mod 256`
+byte split equals the spec word-based hi/lo split, for `n < 2^16`),
+`w16_read_refines` (the CakeML `hi*256+lo` read equals the spec
+`w2n (w16_of_bytes hi lo)`, all bytes), `w2n_eq_small`.
+
+| codec | theorem | status |
+|---|---|---|
+| `contentType` encode | `cml_contentTypeToByte_refines` | **proved** |
+| `contentType` decode | `cml_byteToContentType_refines` | **proved** |
+| `plaintext` encode | `cml_encodePlaintext_refines` | **proved (bound `< 2^16`)** |
+| `plaintext` decode | `cml_decodePlaintext_refines` | **proved** (all inputs) |
+| `ciphertext` encode | `cml_encodeCiphertext_refines` | **proved (bound `< 2^16`)** |
+
+Each `cml_*` function is the hand-mirror of the identically-named
+`cakeml/tls.sml` function (`contentTypeToByte`, `byteToContentType`,
+`encodePlaintext`, `decodePlaintext`, `encodeCiphertext`). The encode theorems
+have the honest `< 2^16` length side condition (the 2-byte wire length field,
+exactly as in Track 2a). Because these mirrors are proved **equal** to the spec
+codecs, the Track 2a round-trip theorems (`decode_encode_plaintext`,
+`decode_encode_ciphertext`, `decode_encode_contentType`) transfer to the
+CakeML-shaped functions.
+
+### State-machine refinement — **partial fragment proved**, full simulation = 2d
+
+The full CakeML `TlsClient.step` (`cakeml/tls_state.sml`) is an
+exception-driven, crypto-bearing byte processor (decrypts flights, runs
+X25519 / AEAD / the key schedule, parses every handshake message, threads a
+15-field state tuple). The `tls_handshakeTheory` automaton is an **abstract**
+event-labeled FSM with no message contents and no keys. A full simulation
+between them requires modeling the entire crypto stack and is the
+"months, not weeks" Track 2d frontier work — **not** attempted here.
+
+What **is** proved is the **control-phase abstraction**: the dispatcher at the
+top of `TlsClient.step` branches purely on three control flags of the state
+tuple (`errorAlert` set?, `cipherSuiteOpt` set?, `connected`). We model exactly
+those flags (`cmlClientCtrl`), define `cmlClientAbs` mapping them to the
+abstract automaton's client phase, and prove (all **proved**, no `cheat`):
+
+* `cml_startHandshake_refines_transition` — the client state built by
+  `TlsClient.startHandshake` (`errorAlert=None`, `cipherSuiteOpt=None`,
+  `connected=False`) abstracts to exactly the abstract automaton's
+  post-`SendClientHello` state: `client_transition CIdle SendClientHello =
+  SOME (cmlClientAbs cmlStartHandshakeCtrl)`. The **first** handshake
+  transition is faithfully refined.
+* `cml_errored_abs_closed` / `cml_closed_refines_transition` — any CakeML
+  client with `errorAlert` set abstracts to `CClosed`, matching the
+  dispatcher's error/teardown branch and `client_transition _ SendCloseNotify
+  = SOME CClosed`.
+* `cml_connected_abs` / `cml_connected_refines_idle` — a non-errored, connected
+  CakeML client abstracts to `CConnected`, on which the automaton idles under
+  application data (`client_transition CConnected SendApplicationData =
+  SOME CConnected`).
+
+This is a **real, sound refinement of the dispatcher's control phases and of
+the initial ClientHello transition** — it is explicitly **not** a full
+simulation of the mid-handshake transitions, which depend on the crypto stack
+and are Track 2d.
+
+### What remains for full 2c and for 2d
+
+* **Full 2c (translator certification).** Replace the hand-mirrored `cml_*`
+  codec definitions with `ml_translatorLib`-extracted deep embeddings of
+  `cakeml/tls.sml` and prove the mirrors are exactly those extractions, closing
+  the "hand-mirror vs certified-extraction" gap noted above. Extend the
+  refined-codec set beyond `contentType`/`plaintext`/`ciphertext` to
+  `clientHello`/`serverHello`/`certificate`/`newSessionTicket` (their CakeML
+  shapes diverge more from the spec — tuples, omitted framing — so each needs
+  its own representation lemmas).
+* **2d (state-machine simulation).** Model the CakeML crypto stack (X25519,
+  AEAD, key schedule, transcript hashing) and the mid-handshake `step`
+  transitions, and discharge a full forward simulation between `TlsClient.step`
+  / `TlsServer.step` and the (suitably enriched) `transition` automaton,
+  including message-content and key-installation modeling currently abstracted
+  away in `tls_handshakeTheory`.
+
+---
+
+## Trusted boundary (summary)
 The HOL4 theorems above rely on **no axioms** and **no proof oracles**. The
 genuine trust assumptions are:
 
@@ -230,21 +345,27 @@ genuine trust assumptions are:
 
 ## Spec ↔ implementation gap (HOL spec vs SML vs CakeML)
 
-There is **no mechanized refinement proof** linking the HOL4 spec to the SML
-(`tls.sml`) or the CakeML port. Concretely:
+A **partial** mechanized refinement now links the HOL4 spec to the CakeML port
+(Track 2c, `tls_refinementTheory`): the `contentType`, `plaintext`, and
+`ciphertext` codecs are **proved equal** to their `cakeml/tls.sml`
+counterparts (hand-mirrored, under the byte-representation map; see the
+`tls_refinementTheory` section above), and the CakeML client dispatcher's
+control phases plus the initial ClientHello transition are **proved** to
+refine the abstract handshake automaton. The remaining gaps:
 
-* The HOL4 wire codecs are an *independent re-modeling* of RFC 8446, aligned
-  with `tls.sml` **by manual inspection** of field order and framing. They are
-  not proved equal to the SML functions, and there is no CakeML
-  translator/extraction theorem connecting either to running code.
-* `clientHello` / `serverHello` / `certificate` / `newSessionTicket` codecs are
-  now modeled in HOL4 with proved round-trips (under `wf<X>` bounds), but they
-  are still an *independent re-modeling* aligned with `tls.sml` by inspection —
-  not proved equal to the SML functions.
-* The key schedule matches the RFC *structurally* and is now validated against
-  two RFC 8448 byte vectors (`rfc8448_early_secret`, `rfc8448_derived_secret`)
-  by computation against a concrete SHA-256; it is not yet proved to match the
-  SML `TlsKeySchedule` module (that mechanized refinement is Track 2c).
+* The proved codec refinement is **hand-mirrored, not yet
+  `ml_translatorLib`-certified**: the `cml_*` HOL functions are proved equal to
+  the spec codecs, but not yet proved to be the deep embeddings the CakeML
+  translator extracts from `cakeml/tls.sml` (the certification step of 2c).
+* The remaining HOL4 wire codecs (`clientHello` / `serverHello` /
+  `certificate` / `newSessionTicket`, and the SML `tls.sml`) are still an
+  *independent re-modeling* aligned by inspection — **not** proved equal to the
+  CakeML/SML functions.
+* The key schedule matches the RFC *structurally* and is validated against two
+  RFC 8448 byte vectors by computation against a concrete SHA-256; it is not
+  yet proved to match the SML/CakeML `TlsKeySchedule` module, and the
+  `ml_translatorLib` equality between `tls_sha256` and `cakeml/sha256.sml` is
+  still open (structural alignment holds today).
 * The handshake theory is an *abstract* state machine. It captures ordering and
   the Finished-before-Connected/AppData safety property, but does not model
   message contents, key installation, or the full server-flight granularity,
@@ -252,8 +373,11 @@ There is **no mechanized refinement proof** linking the HOL4 spec to the SML
 
 In short: the claim supported by these proofs is **"the modeled RFC 8446 wire
 round-trips hold (under stated length bounds), the key-schedule construction is
-structurally the RFC 8446 §7.1 schedule with correct output lengths, and the
+structurally the RFC 8446 §7.1 schedule with correct output lengths, the
 abstract handshake automaton never reaches Connected / emits client
-application data without a verified peer Finished."** It is **not** a claim that
-the SML or CakeML code is correct, nor that the underlying cryptography is
-secure.
+application data without a verified peer Finished, and the CakeML
+`contentType`/`plaintext`/`ciphertext` codecs together with the client
+dispatcher's control phases provably refine the corresponding HOL specs
+(hand-mirrored, modulo the open `ml_translatorLib` certification step)."** It is
+**not** a claim that the full SML or CakeML code is correct, nor that the
+underlying cryptography is secure.
