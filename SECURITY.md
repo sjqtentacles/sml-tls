@@ -42,10 +42,11 @@ A full TLS 1.3 (RFC 8446) client and server state machine in pure Standard ML:
   catch-all backstop maps any unexpected exception to `decode_error`, so
   untrusted input cannot crash `step`.
 
-**Test coverage:** 306 passing tests on both MLton and Poly/ML, including RFC
+**Test coverage:** 317 passing tests on both MLton and Poly/ML (357 in the FFI
+build), including RFC
 8448 vector tests, round-trip tests, negative / tamper tests, PSK-resumption
 accept + negative-binder tests, FFI cross-implementation byte-equality tests,
-and key-zeroization tests.
+and in-place key-zeroization tests.
 
 ### Interoperability (J2)
 
@@ -170,13 +171,31 @@ to compile faithfully rather than an in-logic `compile` evaluation (GAP B).
 The remaining hello/cert/ticket codecs and the full crypto-bearing
 mid-handshake simulation are not yet refined.
 
-### 4. Memory zeroing (partially addressed, best-effort)
+### 4. Memory zeroing (real in-place erasure for per-connection secrets)
 
-`TlsClient.zeroize` / `TlsServer.zeroize` / `zeroizeConfig` overwrite traffic
-keys, derived secrets, and `serverConfig.rsaPrivateKeyDer` via `sodium_memzero`
-(an FFI call the optimizer cannot elide).  **Best-effort caveat:** SML strings
-are immutable and the GC may have copied secrets before zeroization; only the
-currently-referenced buffers are overwritten, so prior copies may survive.
+Per-connection secret material (traffic keys/IVs, derived handshake/application
+secrets, ephemeral private keys, the server's RSA private key, and the PSK
+ticket store) now lives in a mutable, reference-shared `Secret` cell backed by a
+`Word8Array`.  `TlsClient.zeroize` / `TlsServer.zeroize` wipe these buffers **in
+place** via `SecureZero.zero` (`sodium_memzero` in the FFI build, an un-elidable
+`Word8Array.modify` in the pure build), so the erasure is observable through the
+**original** state handle — not merely a rebind on the returned value.  This is
+verified by `test/zeroize.sml`, which captures secrets, calls `zeroize` on the
+original handle, then re-reads the same handle and asserts all-zero, on both
+compilers.
+
+**Residual caveats (honest):**
+- `TlsKeySchedule` outputs and the AEAD interface are still `string`-typed;
+  secrets are converted to bytes only at those boundaries via `Secret.toBytes`,
+  leaving a short-lived transient copy that the GC — not `sodium_memzero` —
+  reclaims.
+- `zeroizeConfig` (client and server) still rebinds the remaining `string`-typed
+  config fields to zeros (prior semantics); only the per-connection state
+  secrets are wiped truly in place.
+- No memory pinning (`sodium_malloc`/`mlock`): holding a persistent C pointer
+  across the purely-functional state threading isn't clean on both compilers,
+  and since the crypto APIs copy `string`s anyway it buys little over the
+  reference-shared `Word8Array` mechanism (`Secret.pinned = false`).
 
 ### 5. No audit
 
@@ -224,7 +243,11 @@ Completed (see `AUDIT.md`, `proof/PROOF_STATUS.md`, `proof/PROOF_CHAIN.md`):
 5. ✅ **Constant-time crypto** (FFI build): X25519 + ChaCha20-Poly1305 via
    libsodium; AES-128/256-GCM + RSA-PSS-SHA256 via OpenSSL libcrypto, with the
    live handshake routed through them in the `sources-ffi.mlb` build.
-6. ✅ **Memory zeroing**: `zeroize` API via `sodium_memzero` (best-effort).
+6. ✅ **Memory zeroing**: `zeroize` wipes per-connection secrets (traffic
+   keys/IVs, derived secrets, ephemeral + RSA private keys, PSK ticket store)
+   **in place** through a reference-shared `Word8Array`-backed `Secret` cell, so
+   erasure is observable on the original state handle on both compilers (see
+   item 4 for residual `string`-boundary / config caveats).
 7. ✅ **PSK resumption (accept path)**: server ticket store, binder
    verification, PSK key schedule.
 

@@ -39,8 +39,10 @@ libsodium for constant-time execution. The audit should cover:
    (libsodium) and AES-128/256-GCM + RSA-PSS-SHA256 (OpenSSL). The default
    (no-FFI) build retains the pure-SML primitives as the portable fallback and
    proof oracle; those are **not** constant-time.
-5. **Key lifecycle** (`SecureZero`, `zeroize` / `zeroizeConfig`): whether key
-   material is erased on teardown and the documented best-effort limits.
+5. **Key lifecycle** (`SecureZero`, `Secret`, `zeroize` / `zeroizeConfig`):
+   per-connection secrets are erased in place on teardown via a reference-shared
+   `Word8Array`-backed `Secret` cell; review the documented residual limits
+   (`string`-typed key-schedule/AEAD boundaries, config rebind, no pinning).
 
 ### Explicitly out of scope (already documented as trusted/assumed)
 - The cryptographic *strength* of SHA-256/HMAC/AEAD/X25519/RSA primitives
@@ -82,10 +84,11 @@ libsodium for constant-time execution. The audit should cover:
   Prior run: 33 000+ inputs crash-free on the parser entry points.
 
 ### 3.2 Test suite
-- 306 passing tests on **both** MLton and Poly/ML (`make test && make test-poly`),
+- 317 passing tests on **both** MLton and Poly/ML (`make test && make test-poly`),
+  357 in the FFI build (`make test-ffi && make test-ffi-poly`),
   including RFC 8448 vectors, round-trip and tamper/negative tests, the PSK
   resumption accept + negative-binder tests, the FFI cross-implementation
-  byte-equality tests, and the zeroize tests.
+  byte-equality tests, and the in-place zeroize tests.
 
 ### 3.3 Formal-verification artifacts
 - `proof/` — 5 HOL4 theories, `Holmake cleanAll && Holmake` clean,
@@ -137,9 +140,16 @@ bash scripts/run_afl.sh
    these in the FFI build; byte-identity (NIST GCM) and pure↔OpenSSL RSA-PSS
    cross-verification are proved in `test/ffi.sml` on both compilers. A
    deployment with a timing adversary must use the FFI build, not the default.
-2. **Memory zeroing is best-effort**: SML strings are immutable and the GC may
-   have copied secrets; `zeroize` overwrites the currently-referenced buffers
-   only (documented in `SECURITY.md`).
+2. **Memory zeroing — real in-place erasure (with bounded residuals)**:
+   per-connection secrets (traffic keys/IVs, derived secrets, ephemeral + RSA
+   private keys, PSK ticket store) live in a mutable, reference-shared
+   `Word8Array`-backed `Secret` cell that `zeroize` wipes in place via
+   `SecureZero.zero`, so erasure is observable through the original state handle
+   on both compilers (asserted in `test/zeroize.sml`). Residuals: key-schedule /
+   AEAD boundaries are still `string`-typed (transient GC-reclaimed copies via
+   `Secret.toBytes`), `zeroizeConfig` still rebinds remaining `string` config
+   fields, and there is no `sodium_malloc`/`mlock` pinning (`Secret.pinned =
+   false`) — all documented in `SECURITY.md` item 4.
 3. **Formal refinement gaps** (do not affect the running pure-SML/FFI library,
    relevant only to the "provably correct to machine code" claim): the Track 2c
    refinement is hand-mirrored (not yet `ml_translatorLib`-certified), and the
