@@ -1,0 +1,34 @@
+== Track 2d: verified-compiler -> machine-code -> run ==
+cake binary : /tmp/cake-arm8-64/cake
+  The CakeML compiler
+  
+  Version details:
+  Thu Jun 18 16:45:52 2026 UTC
+  
+  CakeML: ccfc23cbadf4fadf8c82a7ac60e813ea5906218a
+  HOL4:   d456022724bd61e57303339e998313b6580c592d
+  PolyML: Poly/ML 5.9 Release    RTS version: X86_64-5.9
+source      : /Users/asarkisyan/Documents/sml-tls/cakeml/sha256_test.cml
+scratch     : /var/folders/ly/l8yfhhwj72gd8rm3dg73nw7w0000gn/T//sha256_chain.wzzCLW
+
+[1/3] compiling with verified cake (--target=arm8) ...
+      emitted 7157 lines of arm8-64 assembly (604059 bytes)
+[2/3] assembling + linking with clang ...
+      linked native executable: Mach-O 64-bit executable arm64
+
+[3/3] running verified-compiler-produced machine code ...
+      | PASS empty
+      | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      | PASS abc
+      | ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+      | PASS long
+      | 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+      | DONE
+
+digest verification (machine-code output vs known NIST FIPS 180-4):
+      MATCH empty (""): e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 == NIST
+      MATCH abc: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad == NIST
+      MATCH long (56-byte): 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1 == NIST
+
+RESULT: PASS -- verified compiler produced machine code whose SHA-256
+        output matches the NIST reference digests for all 3 vectors.
